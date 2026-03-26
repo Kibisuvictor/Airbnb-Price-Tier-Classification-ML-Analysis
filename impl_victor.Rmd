@@ -1,0 +1,551 @@
+---
+title: "Impl_Victor"
+output: html_document
+---
+
+```{r load-libraries1, include=FALSE}
+library(tidyverse)
+library(patchwork)
+library(grid)
+library(gridExtra)
+library(tidymodels)
+library(ranger)
+library(vip)
+library(doParallel)
+library(caret)
+
+# Configure parallel processing
+all_cores <- parallel::detectCores(logical = TRUE)
+workers <- max(1, all_cores - 1)
+cl <- makePSOCKcluster(workers)
+registerDoParallel(cl)
+```
+
+```{r, include=FALSE}
+# Load preprocessed data
+df_train <- read_csv("df_train.csv", show_col_types = FALSE)
+df_test <- read_csv("df_test.csv", show_col_types = FALSE)
+
+# Ensure proper data types
+df_train <- df_train %>%
+  mutate(
+    price_tier = factor(price_tier, levels = c("Budget", "Standard", "Premium")),
+    across(where(is.character), as.factor)
+  )
+
+df_test <- df_test %>%
+  mutate(
+    price_tier = factor(price_tier, levels = c("Budget", "Standard", "Premium")),
+    across(where(is.character), as.factor)
+  )
+```
+
+## Random Forest model
+
+This analysis implements a **Random Forest classifier** to predict Airbnb price tiers (Budget, Standard, Premium) in Melbourne. Random Forest is an ensemble method that builds multiple decision trees and aggregates their predictions, providing robust performance and natural resistance to overfitting.
+
+**Target Distribution:**
+```{r target-distribution, include=FALSE}
+knitr::kable(
+  prop.table(table(df_train$price_tier)) %>% 
+    as.data.frame() %>%
+    rename(Price_Tier = Var1, Proportion = Freq) %>%
+    mutate(Proportion = round(Proportion, 3)),
+  caption = "Training Set Class Distribution"
+)
+```
+
+
+### Cross-Validation Strategy
+- Used a **5-fold stratified cross-validation** to maintain class balance and random seed (123) for reproducibility
+We also applied preprocessing steps for the workflow to be reproducible:
+1. **Logical to numeric conversion**: TRUE/FALSE → 1/0 (required for ranger). 2. **Missing value imputation**: Median for numeric, mode for categorical. 3. **Zero-variance removal**: Eliminate uninformative constant features. 4. **Correlation filtering**: Remove highly correlated features (r > 0.9). 5. **Feature normalization**: Standardize numeric predictors for consistent importance metrics. 6. **Rare category grouping**: Combine categories with <1% frequency
+
+### Model Specification
+
+```{r model-spec-rf}
+# Cross validation
+set.seed(123)
+cv_folds <- vfold_cv(df_train, v = 5, strata = price_tier)
+
+# preprocess the data
+rf_recipe <- recipe(price_tier ~ ., data = df_train) %>%
+  step_rm(matches("^id$|^ID$"), skip = TRUE) %>%
+  step_mutate(across(where(is.logical), as.numeric)) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_corr(all_numeric_predictors(), threshold = 0.9) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01, other = "other_combined") %>% 
+  step_dummy(all_nominal_predictors())
+
+# define your model
+rf_spec <- rand_forest(
+  mtry = tune(),
+  trees = tune(),
+  min_n = tune()
+) %>%
+  set_engine(
+    "ranger",
+    importance = "impurity",
+    seed = 123,
+    num.threads = 1
+  ) %>%
+  set_mode("classification")
+
+# Create a workflow
+rf_workflow <- workflow() %>%
+  add_recipe(rf_recipe) %>%
+  add_model(rf_spec)
+
+# define the metrics
+multiclass_metrics <- yardstick::metric_set(
+  yardstick::accuracy,
+  yardstick::roc_auc,
+  yardstick::mn_log_loss,
+  yardstick::sens,
+  yardstick::spec,
+  yardstick::precision,
+  yardstick::f_meas
+)
+```
+
+**Hyperparameters tuned:**
+- **mtry**: Number of features randomly sampled at each split (range: 10-30)
+- **trees**: Number of trees in the forest (range: 500-2,000)
+- **min_n**: Minimum observations in terminal nodes (range: 1-9). **Tuning strategy:** Latin hypercube sampling with 20 combinations for efficient parameter space coverage
+```{r hyperparameter-tuning, echo=TRUE, message=TRUE, warning=FALSE}
+# Check if tuning results already exist
+if (file.exists("rf_tune_res.rds")) {
+  #cat("✅ Loading saved tuning results...\n")
+  rf_list <- readRDS("rf_tune_res.rds")
+  rf_tune_results <- rf_list$tune_results
+  rf_workflow <- rf_list$rf_workflow
+} else {
+  cat("⚙️ Running hyperparameter tuning (first time, may take a while)...\n")
+  
+  rf_grid <- grid_space_filling(
+    parameters(
+      mtry(range = c(5, 20)),
+      trees(range = c(1000, 2000)),
+      min_n(range = c(1, 9))
+    ),
+    size = 5,
+    original = "lhs"
+  )
+  
+  tune_control <- control_grid(
+    save_pred = TRUE,
+    save_workflow = FALSE,
+    verbose = FALSE,
+    allow_par = TRUE,
+    parallel_over = "everything"
+  )
+  
+  start_time <- Sys.time()
+  set.seed(456)
+  
+  rf_tune_results <- tune_grid(
+    rf_workflow,
+    resamples = cv_folds,
+    grid = rf_grid,
+    metrics = multiclass_metrics,
+    control = tune_control
+  )
+  
+  rf_list <- list(
+    tune_results = rf_tune_results,
+    rf_workflow = rf_workflow
+  )
+  
+  saveRDS(rf_list, file = "rf_tune_res.rds")
+  end_time <- Sys.time()
+  tuning_duration <- difftime(end_time, start_time, units = "mins")
+  #cat("💾 Tuning complete and saved. Duration:", round(tuning_duration, 2), "mins\n")
+}
+```
+
+```{r best-params, include=FALSE}
+rf_list <- readRDS('rf_tune_res.rds')
+rf_tune_results <- rf_list$tune_results
+rf_workflow <- rf_list$rf_workflow
+best_params <- select_best(rf_tune_results, metric = "roc_auc")
+
+knitr::kable(
+  best_params %>% 
+    select(mtry, trees, min_n) %>%
+    mutate(across(everything(), as.integer)),
+  caption = "Best Hyperparameters (selected by ROC AUC)"
+)
+```
+
+**Interpretation:**
+- **mtry = `r best_params$mtry`**: Uses `r best_params$mtry` features per split (out of ~`r ncol(df_train)-1` total)
+- **trees = `r best_params$trees`**: Ensemble of `r best_params$trees` decision trees
+- **min_n = `r best_params$min_n`**: Minimum `r best_params$min_n` observations required to split a node
+
+```{r cv-performance, include=FALSE}
+cv_summary <- tibble(
+  Metric = c("ROC AUC", "Accuracy", "F1 Score"),
+  CV_Mean = c(
+    show_best(rf_tune_results, metric = "roc_auc", n = 1)$mean,
+    show_best(rf_tune_results, metric = "accuracy", n = 1)$mean,
+    show_best(rf_tune_results, metric = "f_meas", n = 1)$mean
+  )
+) %>%
+  mutate(
+    CV_Mean = round(CV_Mean, 4)
+  )
+```
+
+### Hyperparameter Tuning Visualization
+
+```{r fig-tuning-results, include=FALSE, fig.cap="Model performance across different hyperparameter combinations. Each point represents a unique configuration."}
+autoplot(rf_tune_results, metric = "roc_auc") +
+  labs(
+    title = "Random Forest Hyperparameter Tuning Results",
+    subtitle = "5-Fold Cross-Validation - ROC AUC"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5)
+  )
+
+rf_tune_results %>%
+  collect_metrics() %>%
+  filter(.metric %in% c("accuracy", "roc_auc")) %>%
+  ggplot(aes(x = trees, y = mean, color = factor(mtry))) +
+  facet_wrap(~.metric, scales = "free_y") +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_viridis_d(option = "plasma", end = 0.9) +
+  labs(
+    title = "Impact of Number of Trees on Performance",
+    x = "Number of Trees",
+    y = "Mean Metric Value",
+    color = "mtry"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "bottom"
+  )
+
+g1 <- rf_tune_results %>%
+  collect_metrics() %>%
+  filter(.metric == "accuracy") %>%
+  ggplot(aes(x = mtry, y = mean)) +
+  geom_point(aes(size = trees, color = min_n), alpha = 0.7) +
+  geom_smooth(method = "loess", se = TRUE, color = "darkblue", linewidth = 1) +
+  scale_color_viridis_c(option = "mako") +
+  scale_size_continuous(range = c(2, 8)) +
+  labs(
+    title = "Feature Sampling (mtry) Impact on Accuracy",
+    x = "Number of Features per Split (mtry)",
+    y = "Mean Accuracy",
+    color = "min_n",
+    size = "trees"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+```
+
+**Key Findings:**
+- Model performance `r ifelse(max(cv_summary$CV_Mean) - min(cv_summary$CV_Mean) < 0.05, "is relatively stable", "varies significantly")` across different hyperparameter combinations
+- `r ifelse(best_params$trees > 1500, "High", ifelse(best_params$trees < 750, "Low", "Moderate"))` number of trees (`r best_params$trees`) suggests `r ifelse(best_params$trees > 1500, "ensemble diversity is beneficial", "efficiency-accuracy trade-off")`
+- `r ifelse(best_params$mtry < 15, "Low", ifelse(best_params$mtry > 25, "High", "Moderate"))` mtry value indicates `r ifelse(best_params$mtry < 15, "high randomness per tree", ifelse(best_params$mtry > 25, "using most features per split", "balanced feature sampling"))`
+```{r train-final}
+final_rf_workflow <- finalize_workflow(rf_workflow, best_params)
+final_rf_fit <- fit(final_rf_workflow, data = df_train)
+final_rf_model <- extract_fit_parsnip(final_rf_fit)
+
+test_predictions <- predict(final_rf_fit, df_test) %>%
+  bind_cols(predict(final_rf_fit, df_test, type = "prob")) %>%
+  bind_cols(df_test %>% select(price_tier))
+
+# Calculate all metrics
+test_accuracy <- yardstick::accuracy(test_predictions, truth = price_tier, estimate = .pred_class)
+test_sensitivity <- yardstick::sensitivity(test_predictions, truth = price_tier, estimate = .pred_class, estimator = "macro")
+test_specificity <- yardstick::specificity(test_predictions, truth = price_tier, estimate = .pred_class, estimator = "macro")
+test_precision <- yardstick::precision(test_predictions, truth = price_tier, estimate = .pred_class, estimator = "macro")
+test_f1 <- yardstick::f_meas(test_predictions, truth = price_tier, estimate = .pred_class, estimator = "macro")
+
+prob_cols <- names(test_predictions)[stringr::str_detect(names(test_predictions), "^\\.pred_")]
+prob_cols <- prob_cols[prob_cols != ".pred_class"]
+test_roc_auc <- yardstick::roc_auc(test_predictions, truth = price_tier, all_of(prob_cols), estimator = "hand_till")
+
+test_logloss <- yardstick::mn_log_loss(test_predictions, truth = price_tier, all_of(prob_cols))
+
+
+```
+
+
+```{r test-metrics-table, include=FALSE}
+test_metrics <- bind_rows(
+  test_accuracy,
+  test_roc_auc,
+  test_logloss,
+  test_sensitivity,
+  test_specificity,
+  test_precision,
+  test_f1
+) %>%
+  select(.metric, .estimate) %>%
+  mutate(
+    .metric = recode(.metric,
+      "accuracy" = "Accuracy",
+      "roc_auc" = "ROC AUC",
+      "mn_log_loss" = "Log Loss",
+      "sens" = "Sensitivity (Macro)",
+      "spec" = "Specificity (Macro)",
+      "precision" = "Precision (Macro)",
+      "f_meas" = "F1 Score (Macro)"
+    ),
+    .estimate = round(.estimate, 4)
+  ) %>%
+  rename(Metric = .metric, Value = .estimate)
+
+knitr::kable(
+  test_metrics,
+  caption = "Final Model Performance on Test Set (n = 4,580)",
+  align = c('l', 'r')
+)
+```
+
+```{r caret-confusion, include=FALSE}
+# Generate caret confusion matrix for detailed metrics
+caret_cm <- caret::confusionMatrix(
+  test_predictions$.pred_class,
+  df_test$price_tier
+)
+
+# Extract per-class metrics
+class_stats <- as.data.frame(caret_cm$byClass) %>%
+  rownames_to_column("Class") %>%
+  mutate(Class = str_remove(Class, "Class: ")) %>%
+  select(
+    Class,
+    Sensitivity,
+    Specificity,
+    Precision = `Pos Pred Value`,
+    F1,
+    `Balanced Accuracy`
+  ) %>%
+  mutate(across(where(is.numeric), ~round(., 3)))
+
+knitr::kable(
+  class_stats,
+  caption = "Per-Class Performance Metrics"
+)
+
+test_conf_mat <- yardstick::conf_mat(test_predictions, truth = price_tier, estimate = .pred_class)
+
+# Display as table
+conf_mat_table <- test_conf_mat$table %>%
+  as.data.frame() %>%
+  pivot_wider(names_from = Prediction, values_from = Freq)
+
+knitr::kable(
+  conf_mat_table,
+  caption = "Confusion Matrix: True Labels (rows) vs Predicted Labels (columns)"
+)
+
+```
+
+```{r fig-confusion-heatmap,include=FALSE, fig.cap="Confusion matrix heatmap. Darker colors on the diagonal indicate correct predictions."}
+autoplot(test_conf_mat, type = "heatmap") +
+  labs(
+    title = "Test Set Confusion Matrix",
+    subtitle = paste0("Overall Accuracy: ", round(test_accuracy$.estimate, 3))
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5)
+  )
+```
+
+
+```{r confusion-insights, results='asis', include=FALSE}
+# Calculate misclassification patterns
+conf_data <- test_conf_mat$table %>% as.data.frame()
+
+# Find most common misclassification
+misclass <- conf_data %>%
+  filter(Truth != Prediction) %>%
+  arrange(desc(Freq)) %>%
+  head(1)
+
+cat(paste0(
+  "- Most common error: Predicting **", misclass$Prediction, 
+  "** when true class is **", misclass$Truth, 
+  "** (", misclass$Freq, " cases)\n"
+))
+
+# Calculate diagonal accuracy
+diag_sum <- sum(diag(test_conf_mat$table))
+total <- sum(test_conf_mat$table)
+cat(paste0("- Correctly classified: ", diag_sum, " out of ", total, " observations (", 
+           round(diag_sum/total*100, 1), "%)\n"))
+
+# Class-specific insights
+for(class in levels(df_test$price_tier)) {
+  class_total <- sum(test_conf_mat$table[class, ])
+  class_correct <- test_conf_mat$table[class, class]
+  class_acc <- round(class_correct / class_total, 3)
+  cat(paste0("- **", class, "** tier: ", class_acc, " accuracy (", 
+             class_correct, "/", class_total, ")\n"))
+}
+```
+
+### ROC Curves and parameter tuning visualization
+
+```{r fig-roc-curves, fig.cap="ROC curves for each price tier using one-vs-all strategy. Curves closer to top-left indicate better discrimination.", warning=FALSE}
+
+roc_data <- test_predictions %>%
+  yardstick::roc_curve(truth = price_tier, all_of(prob_cols))
+
+# autoplot(roc_data) +
+#   labs(
+#     title = "ROC Curves by Price Tier (One-vs-All)",
+#     subtitle = paste0("Overall AUC (Hand & Till): ", round(test_roc_auc$.estimate, 4))
+#   ) +
+#   theme_minimal(base_size = 12) +
+#   theme(
+#     plot.title = element_text(hjust = 0.5, face = "bold"),
+#     plot.subtitle = element_text(hjust = 0.5),
+#     legend.position = "bottom"
+#   )
+
+g3 <- roc_data %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color = .level)) +
+  geom_path(linewidth = 1) +
+  geom_abline(lty = 2, color = "gray50") +
+  coord_equal() +
+  scale_color_viridis_d(option = "plasma", end = 0.9) +
+  labs(
+    title = "ROC Curves by Price Tier (One-vs-All)",
+    subtitle = paste0("Overall AUC (Hand & Till): ", round(test_roc_auc$.estimate, 4)),
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    color = "Price Tier"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "bottom"
+  )
+
+g3+g1
+
+```
+
+```{r generalization-check}
+comparison <- tibble(
+  Metric = c("ROC AUC", "Accuracy", "F1 Score"),
+  `Cross-Validation` = c(
+    show_best(rf_tune_results, metric = "roc_auc", n = 1)$mean,
+    show_best(rf_tune_results, metric = "accuracy", n = 1)$mean,
+    show_best(rf_tune_results, metric = "f_meas", n = 1)$mean
+  ),
+  `Test Set` = c(
+    test_roc_auc$.estimate,
+    test_accuracy$.estimate,
+    test_f1$.estimate
+  )
+) %>%
+  mutate(
+    Difference = `Test Set` - `Cross-Validation`,
+    `% Change` = round((Difference / `Cross-Validation`) * 100, 2),
+    across(c(`Cross-Validation`, `Test Set`), ~round(., 4))
+  )
+
+# knitr::kable(
+#  comparison,
+#  caption = "Cross-Validation vs Test Set Performance Comparison")
+
+g4 <- gridExtra::tableGrob(
+  comparison,
+  rows = NULL,
+  theme = gridExtra::ttheme_minimal(
+    core = list(fg_params = list(hjust = 0, x = 0.1)),
+    colhead = list(fg_params = list(fontface = "bold"))
+  )
+)
+
+# Add title to the table
+g4 <- gridExtra::arrangeGrob(
+  g4,
+  top = grid::textGrob(
+    "Cross-Validation vs Test Set Performance",
+    gp = grid::gpar(fontsize = 12, fontface = "bold")
+  )
+)
+
+```
+
+```{r feature-importance, include=FALSE}
+importance_scores <- final_rf_model %>%
+  extract_fit_engine() %>%
+  vip::vi()
+```
+
+#### Most Important Feature analysis and model generalization
+
+```{r importance-table, include=FALSE}
+knitr::kable(
+  head(importance_scores, 20) %>%
+    mutate(
+      Importance = round(Importance, 2),
+      Rank = row_number()
+    ) %>%
+    select(Rank, Variable, Importance),
+  caption = "Top 20 Features by Importance (Gini Impurity)"
+)
+```
+
+```{r fig-feature-importance, fig.cap="Variable importance based on mean decrease in Gini impurity. Higher values indicate more influential features."}
+g2 <- importance_scores %>%
+  slice_max(order_by = Importance, n = 20) %>%
+  ggplot(aes(x = Importance, y = reorder(Variable, Importance))) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  geom_text(aes(label = round(Importance, 1)), hjust = -0.1, size = 3) +
+  labs(
+    title = "Top 20 Most Important Features",
+    subtitle = "Random Forest - Gini Impurity Importance",
+    x = "Importance Score",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5),
+    panel.grid.major.y = element_blank()
+  ) +
+  xlim(0, max(importance_scores$Importance[1:20]) * 1.1)
+
+
+g2+wrap_elements(g4)
+```
+**Generalization Assessment:**
+`r if(abs(comparison$"% Change"[1]) < 2) {"✓ **Excellent generalization** - CV and test performance are nearly identical (<2% difference)"} else if(abs(comparison$"% Change"[1]) < 5) {"✓ **Good generalization** - Minor difference between CV and test (<5%)"} else {"⚠️ **Potential overfitting** - Notable gap between CV and test performance (>5%)"}`. The Random Forest model `r if(comparison$"% Change"[1] > 0) {"performs slightly better"} else {"performs slightly worse"}` on the test set compared to cross-validation, with a `r abs(comparison$"% Change"[1])`% difference in ROC AUC.
+
+### Model Performance Summary
+
+The Random Forest classifier achieved:
+- **`r round(test_accuracy$.estimate * 100, 1)`% overall accuracy** on the test set
+- **`r round(test_roc_auc$.estimate, 3)` ROC AUC** indicating `r ifelse(test_roc_auc$.estimate > 0.85, "excellent", ifelse(test_roc_auc$.estimate > 0.75, "good", "moderate"))` discrimination ability
+- **`r round(test_f1$.estimate, 3)` F1 score** demonstrating balanced precision and recall
+- **`r abs(round(comparison$"% Change"[1], 1))`% difference** between CV and test performance (strong generalization)
+
+```{r cleanup, include=FALSE}
+stopCluster(cl)
+registerDoSEQ()
+```
+

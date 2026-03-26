@@ -1,0 +1,331 @@
+---
+title: "impl_calvin"
+output: html_document
+---
+
+
+## K Nearest Neighbors
+
+```{r}
+library(tidymodels)
+library(yardstick)
+library(gridExtra)
+library(patchwork)
+
+# load preprocessed data
+train = read.csv('train.csv')
+test = read.csv('test.csv')
+
+# convert target column to factor
+train$price_tier <- as.factor(train$price_tier)
+test$price_tier <- as.factor(test$price_tier)
+
+# standardization: important for knn as knn is sensitive to scale
+rec <- recipe(price_tier ~ ., data = train) %>%
+  step_normalize(all_numeric_predictors())
+
+
+# ================================================
+#               HYPERPARAMETER TUNING
+# ================================================
+
+# Define model and workflow
+knn_def <- nearest_neighbor(
+  mode = 'classification',
+  neighbors  = tune(),
+  dist_power  = tune(),
+  weight_func = "rectangular" # unweighted -> standard kNN
+) %>% 
+  set_engine("kknn")
+
+knn_wf <- workflow() %>%
+  add_model(knn_def) %>%
+  add_recipe(rec)
+
+# Cross-validation folds
+set.seed(5003)
+cv_folds <- vfold_cv(train, v = 5, strata = price_tier)
+
+# Define weighted metrics for multiclass classification
+f_meas_weighted <- metric_tweak(
+  .name = "f_meas_weighted",
+  .fn   = yardstick::f_meas,
+  estimator = "macro_weighted"
+)
+
+precision_weighted <- metric_tweak(
+  .name = "precision_weighted",
+  .fn   = yardstick::precision,
+  estimator = "macro_weighted"
+)
+
+recall_weighted <- metric_tweak(
+  .name = "recall_weighted",
+  .fn   = yardstick::recall,
+  estimator = "macro_weighted"
+)
+
+multiclass_metrics <- metric_set(
+  yardstick::accuracy,
+  yardstick::sens,
+  yardstick::spec,
+  yardstick::precision,
+  yardstick::f_meas,
+  f_meas_weighted,
+  precision_weighted,
+  recall_weighted
+)
+
+# Define parameter grid
+param_grid <- tidyr::crossing(
+  neighbors  = seq(5, 50, 5),
+  dist_power = c(1, 2)
+)
+
+ctrl <- control_grid(save_pred = TRUE, verbose = TRUE)
+
+# ------------------------------------------------
+#        Load or perform tuning
+# ------------------------------------------------
+
+if (file.exists("knn_tune_res.rds")) {
+  #cat("✅ Loading saved KNN tuning results...\n")
+  knn_tune_res <- readRDS("knn_tune_res.rds")
+} else {
+  #cat("⚙️ Running KNN hyperparameter tuning (this may take a few minutes)...\n")
+  
+  knn_tune_res <- tune_grid(
+    knn_wf,
+    resamples = cv_folds,
+    grid      = param_grid,
+    metrics   = multiclass_metrics,
+    control   = ctrl
+  )
+  
+  saveRDS(knn_tune_res, file = "knn_tune_res.rds")
+  #cat("💾 Tuning results saved to knn_tune_res.rds\n")
+}
+
+
+
+
+# ================================================
+#                PLOT TUNING RESULTS
+# ================================================
+
+m <- collect_metrics(knn_tune_res)
+
+if ("dist_power" %in% names(m)) {
+  m <- m %>%
+    mutate(dist_power = factor(dist_power,
+                               levels = c(1, 2),
+                               labels = c("L1 (p=1)", "L2 (p=2)")))
+}
+
+res_plot <- m %>%
+  filter(.metric %in% c('f_meas_weighted')) %>% 
+  ggplot(aes(x = neighbors, y = mean,
+             color = if ('dist_power' %in% names(m)) dist_power else NULL)) +
+  facet_wrap(~ .metric, scales = 'free_y') +
+  geom_line() +
+  geom_point() +
+  geom_errorbar(aes(ymin = mean - std_err, ymax = mean + std_err), width = 0.6) +
+  scale_x_continuous(breaks = sort(unique(m$neighbors))) +
+  labs(
+    title = 'knn: CV Weighted F1-Score',
+    x = 'k (neighbors)',
+    y = 'CV mean \u00B1 SE',
+    color = 'Distance'
+  ) +
+  theme_minimal()
+
+
+# ================================================
+#     FINAL MODEL (HIGHEST WEIGHTED F1 SCORE)
+# ================================================
+
+if (file.exists("best_knn.rds")) {
+  #cat("✅ Loading saved final KNN model...\n")
+  best_knn <- readRDS("best_knn.rds")
+} else {
+  #cat("⚙️ Training final KNN model...\n")
+  best_params <- select_best(knn_tune_res, metric = 'f_meas_weighted')
+  best_knn_wf <- finalize_workflow(knn_wf, best_params)
+  best_knn <- fit(best_knn_wf, data = train)
+  saveRDS(best_knn, file = "best_knn.rds")
+  #cat("💾 Final KNN model saved to best_knn.rds\n")
+}
+
+
+
+# ================================================
+#     PLOTS TO EVALUATE FINAL MODEL PERFORMANCE
+# ================================================
+
+# Check if saved predictions exist
+if (file.exists("best_knn_pred.rds")) {
+  #message("Loading saved predictions...")
+  best_knn_pred <- readRDS("best_knn_pred.rds")
+} else {
+  #message("Generating predictions and saving results...")
+  best_knn_pred <- predict(best_knn, test) %>%
+    bind_cols(test)
+  saveRDS(best_knn_pred, file = "best_knn_pred.rds")
+}
+
+# Generate confusion matrix
+cm <- conf_mat(best_knn_pred, truth = price_tier, estimate = .pred_class)
+
+# Convert confusion matrix to a tidy data frame
+cm_df <- as.data.frame(cm$table)
+colnames(cm_df) <- c("Predicted", "Actual", "Freq")
+
+
+# plot confusion matrix
+cm_plot <- ggplot(cm_df, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile(color = "white", , linewidth = 0.5) +
+  geom_text(aes(label = Freq), size = 3.5, color = "black", fontface = "bold") +
+  scale_fill_gradient(low = "white", high = "#1E90FF") +
+  labs(
+    title = "Confusion Matrix",
+    x = "Actual Price Tier",
+    y = "Predicted Price Tier",
+    fill = "Count"
+  ) +
+  theme_minimal(base_size = 10) +  # Reduced base size for grid layout
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title = element_text(size = 9),
+    axis.text = element_text(size = 8),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 7)
+  )
+
+
+
+# classification report table
+overall_acc <- sum(cm_df$Freq[cm_df$Predicted == cm_df$Actual]) / sum(cm_df$Freq)
+class_levels <- levels(test$price_tier)
+
+report_table <- map_dfr(class_levels, function(cls) {
+  TP <- cm_df$Freq[cm_df$Actual == cls & cm_df$Predicted == cls]
+  FN <- sum(cm_df$Freq[cm_df$Actual == cls & cm_df$Predicted != cls])
+  FP <- sum(cm_df$Freq[cm_df$Actual != cls & cm_df$Predicted == cls])
+  Support <- sum(cm_df$Freq[cm_df$Actual == cls])
+
+  Precision <- TP / (TP + FP)
+  Recall    <- TP / (TP + FN)
+  F1        <- 2 * (Precision * Recall) / (Precision + Recall)
+
+  tibble(
+    Class = cls,
+    Precision = Precision,
+    Recall = Recall,
+    F1 = F1,
+    Support = Support
+  )
+})
+
+macro_row <- report_table %>%
+  summarise(
+    Class = "Macro Avg",
+    Precision = mean(Precision),
+    Recall    = mean(Recall),
+    F1        = mean(F1),
+    Support   = sum(Support)
+  )
+
+weighted_row <- report_table %>%
+  summarise(
+    Class = "Weighted Avg",
+    Precision = weighted.mean(Precision, w = Support),
+    Recall    = weighted.mean(Recall, w = Support),
+    F1        = weighted.mean(F1, w = Support),
+    Support   = sum(Support)
+  )
+
+# save for result table
+wp_knn <- weighted.mean(report_table$Precision, w = report_table$Support)
+wr_knn <- weighted.mean(report_table$Recall, w = report_table$Support)
+wf_knn <- weighted.mean(report_table$F1, w = report_table$Support)
+
+# merge result into a single table
+final_report <- bind_rows(report_table, macro_row, weighted_row) %>%
+  mutate(across(c(Precision, Recall, F1), ~ round(.x, 4)))
+
+display_df <- final_report %>%
+  mutate(
+    Precision = sprintf("%.4f", Precision),
+    Recall    = sprintf("%.4f", Recall),
+    F1        = sprintf("%.4f", F1)
+  ) %>%
+  dplyr::select(Class, Precision, Recall, F1, Support)
+
+
+row_n  <- nrow(display_df)
+row_bg <- c(rep(c("#F8F9FA", "#FFFFFF"), length.out = max(row_n - 2, 0)),
+            rep("#E8F4F8", min(2, row_n)))   # last two rows shaded
+
+table_theme <- ttheme_minimal(
+  base_size = 10,
+  core = list(
+    fg_params = list(hjust = 0.5, x = 0.5),
+    bg_params = list(fill = row_bg)
+  ),
+  colhead = list(
+    fg_params = list(fontface = "bold", fontsize = 11, col = "white"),
+    bg_params = list(fill = "#1E90FF")
+  ),
+  rowhead = list(fg_params = list(hjust = 0.5, x = 0.5))
+)
+
+
+tbl_grob <- tableGrob(display_df, rows = NULL, theme = table_theme)
+tbl_grob$widths <- unit(rep(1, ncol(display_df)), "null")
+
+
+classification_report_plot <- ggplot() +
+  annotation_custom(
+    grob = tbl_grob,
+    xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf
+  ) +
+  theme_void() +
+  labs(
+    title    = "Classification Report",
+    subtitle = paste("Overall Accuracy:", sprintf("%.4f", overall_acc))
+  ) +
+  theme(
+    plot.title    = element_text(size = 16, face = "bold", hjust = 0.5, margin = margin(b = 5)),
+    plot.subtitle = element_text(size = 11, face = "bold", hjust = 0.5, margin = margin(b = 10)),
+    plot.margin   = margin(10, 10, 10, 10)
+  )
+
+
+
+# ================================================
+#                COMBINE VISUALIZATIONS
+# ================================================
+(res_plot | cm_plot) / classification_report_plot +
+  plot_layout(heights = c(1, 2), guides = "collect")
+
+
+```
+
+The K-Nearest Neighbors model was optimized using cross-validation on weighted F1-score. The tuning process evaluated different neighborhood sizes (k) and distance metrics (L1 and L2). The results show that performance improves as k increases and stabilizes around k ≥ 25, with L1 distance consistently outperforming L2. The best-performing configuration selected by cross-validation is k = 45 and L1 distance. The final model achieved **71.1% overall accuracy**, with Budget predicted most reliably, Premium showing high precision but lower recall, and Standard being the most difficult class due to frequent confusion with Budget and Premium.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

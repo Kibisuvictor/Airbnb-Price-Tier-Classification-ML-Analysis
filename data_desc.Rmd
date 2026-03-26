@@ -1,0 +1,142 @@
+# Data Description
+
+## Data Sources  
+
+- Primary Dataset: Melbourne Airbnb listings, obtained from OpenML (OpenML, n.d.) (download: Kaggle (TylerX, n.d.), original source: insideairbnb (Inside Airbnb, n.d.))
+
+- Publication: (Shi et al., 2021) benchmarked multimodal AutoML methods for tabular data with text fields.
+
+## Data Composition
+
+```{r, results='asis'}
+# -------------------------------
+# Load dataset
+# -------------------------------
+airbnb_data <- read.arff("dataset_")
+
+# Convert character columns to factors
+char_cols <- sapply(airbnb_data, is.character)
+airbnb_data[char_cols] <- lapply(airbnb_data[char_cols], as.factor)
+
+# Ensure target variable is factor
+if ("price_label" %in% names(airbnb_data)) {
+  airbnb_data$price_label <- as.factor(airbnb_data$price_label)
+}
+
+airbnb_data <- airbnb_data %>% select(-c(space, description, summary))
+
+# Display as interactive scrollable table
+datatable(
+  airbnb_data[1:5,],
+  options = list(
+    pageLength = 1,       # show 1 rows per page
+    scrollX = TRUE,        # horizontal scroll
+    scrollY = "100px"      # vertical scroll with fixed height
+  )
+)
+
+# -------------------------------
+# Missingness plot (top 10 cols)
+# -------------------------------
+total_missing <- sum(is.na(airbnb_data))
+missing_top10 <- sort(colSums(is.na(airbnb_data)), decreasing = TRUE)[1:10]
+
+missing_df <- data.frame(
+  Column = names(missing_top10),
+  Missing = as.numeric(missing_top10)
+)
+
+missingness_plot <- ggplot(missing_df, aes(x = reorder(Column, Missing), y = Missing)) +
+  geom_col(fill = "#E69F00") +
+  coord_flip() +
+  labs(
+    title = "Top 10 Columns with Missing Values",
+    x = "",
+    y = "Number of Missing Values"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    panel.grid = element_blank(),       # removes all grid lines
+    panel.background = element_blank(), # removes background
+    axis.line = element_line(color = "black"),  # adds clean axes lines
+    axis.ticks = element_line(color = "black")  # show ticks
+  )
+
+# -------------------------------
+# Target Histogram
+# -------------------------------
+target_histogram <- ggplot(airbnb_data, aes(x = price_label)) +
+  geom_bar(fill = "#E69F00") +
+  geom_text(stat='count', aes(label=..count..), vjust=1, size=3.5, color = "white") +
+  labs(
+    title = "Target Class Distribution",
+    x = "Price Category",
+    y = ""
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    panel.grid = element_blank(),       # removes all grid lines
+    panel.background = element_blank(), # removes background
+    axis.line = element_line(color = "black"),  # adds clean axes lines
+    axis.ticks = element_line(color = "black")  # show ticks
+  )
+
+# -------------------------------
+# Outliers
+# -------------------------------
+
+# Count outliers per numeric column
+outliers_summary <- airbnb_data %>%
+  select(where(is.numeric)) %>%
+  summarise(across(everything(), ~ sum(abs(scale(.)) > 3, na.rm = TRUE))) %>%
+  pivot_longer(everything(), names_to = "Column", values_to = "Outliers")
+
+# ---- Outliers Plot ----
+plot_outliers <- outliers_summary %>%
+  filter(Column != "TOTAL") %>%
+  ggplot(aes(x = reorder(Column, Outliers), y = Outliers)) +
+  geom_col(fill = "#E69F00") +
+  coord_flip() +
+  geom_text(aes(label = Outliers), hjust = -0.1, size = 3.5) +
+  labs(
+    title = "Outliers per Numeric Column",
+    x = "",
+    y = "Number of Outliers"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    panel.grid = element_blank(),       # removes all grid lines
+    panel.background = element_blank(), # removes background
+    axis.line = element_line(color = "black"),  # adds clean axes lines
+    axis.ticks = element_line(color = "black")  # show ticks
+  )
+# -------------------------------
+# Summary statistics
+# -------------------------------
+num_samples <- nrow(airbnb_data)
+num_features <- ncol(airbnb_data) - 1  # exclude target
+num_price_categories <- length(unique(airbnb_data$price_label))
+num_numeric <- sum(sapply(airbnb_data, is.numeric))
+num_factor <- sum(sapply(airbnb_data, is.factor))
+total_duplicates <- sum(duplicated(airbnb_data))
+
+glue::glue(
+  "The dataset has {num_samples} samples, {num_features} features, 
+   {num_price_categories} price categories, {num_numeric} numeric and 
+   {num_factor} factor columns. The count of duplicate rows is: {total_duplicates}"
+)
+
+# ---- Combine Plots ----
+#plot_outliers + missingness_plot / target_histogram
+```
+
+## Target Class
+The target class "price_label" (remapped to price_tier) is a categorical variable with 10 different price levels ("0" through "9"). The dataset can thus be used for multi-class classification.
+
+## Dataset Complexity Analysis
+
+Our dataset meets four of the difficulty criteria: Large size (>10,000 observations), Messy (substantial missing values like license and monthly_price), Complex (>100 features with mixed data types), and Multi-class classification (10 price categories), all of which require careful pre-processing and feature engineering for robust modeling.
+

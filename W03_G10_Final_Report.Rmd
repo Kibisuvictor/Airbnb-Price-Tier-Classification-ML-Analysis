@@ -1,0 +1,247 @@
+---
+title: "What Makes an Airbnb Premium?
+Machine Learning Analysis of Melbourne Listings"
+author: "Joel John Kurien (540666979) | Qilong Zou (550542832) | Subhamay Ghosh (550535650)) | Victor Kibisu Alusa (540921269) | Wengan Li (510010137) "
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: false
+    toc_float: false
+    theme: flatly
+    highlight: tango
+    code_folding: hide
+    number_sections: true
+    fig_width: 7
+    fig_height: 4
+    dpi: 72
+---
+
+<!-- Inline CSS -->
+
+```{=html}
+<style>
+/* Base body text */
+body {
+  font-size: 11px;
+  line-height: 1.4;
+  font-family: Arial, sans-serif;
+}
+
+/* Reduce the document title */
+h1.title {
+  font-size: 18px !important;
+  font-weight: bold;
+  margin-top: 0.5em;
+  margin-bottom: 0.5em;
+}
+
+/* Restore natural header hierarchy */
+h1 {
+  font-size: 16px;
+  font-weight: bold;
+  margin-top: 1em;
+  margin-bottom: 0.5em;
+}
+h2 {
+  font-size: 14px;
+  font-weight: bold;
+  margin-top: 0.8em;
+  margin-bottom: 0.4em;
+}
+h3 {
+  font-size: 12px;
+  font-weight: bold;
+  margin-top: 0.6em;
+  margin-bottom: 0.3em;
+}
+h4, h5, h6 {
+  font-size: 11px;
+  font-weight: bold;
+  margin-top: 0.5em;
+  margin-bottom: 0.3em;
+}
+
+/* Paragraph spacing */
+p {
+  margin-top: 0.4em;
+  margin-bottom: 0.4em;
+}
+
+/* Lists */
+ul, ol {
+  margin-top: 0.4em;
+  margin-bottom: 0.4em;
+}
+
+/* Tables */
+table {
+  font-size: 10px;
+  margin: 0.4em 0;
+}
+th, td {
+  padding: 2px 6px;
+}
+
+/* Figures */
+img, svg, figure {
+  max-width: 100% !important;
+  height: auto !important;
+  margin: 0.4em auto;
+  display: block;
+}
+
+/* Code blocks */
+pre, code {
+  font-size: 10px !important;
+  line-height: 1.3;
+}
+
+/* Apply compact layout for print as well */
+@media print {
+  @page { margin: 0.75in; }
+}
+</style>
+```
+
+```{r, include=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE, 
+  fig.width = 12,   # wider figure for full page
+  fig.height = 6,
+  fig.align = 'default',  # allow full width
+  dpi = 72
+)
+
+# Load packages
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(ggplot2)
+library(patchwork)
+library(corrplot)
+library(ranger)
+library(vip)
+library(GGally)
+library(VIM)
+library(viridis)
+library(tidymodels)
+library(glue)
+library(VIM)
+library(stringi)
+library(stringr)
+library(DT)
+library(RWeka)      # RWeka is more robust than foreign for ARFF files
+library(naniar)     # for missingness plots
+library(gridExtra)  # for multiple plots
+library(caret)
+library(tibble)
+
+# Colorblind-friendly palette
+cb_palette <- c("#E69F00", "#56B4E9", "#009E73")
+```
+
+```{r child = 'prob_def.Rmd'}
+```
+
+```{r child = 'data_desc.Rmd'}
+```
+
+```{r child = 'data_cleaning_calvin.Rmd'}
+```
+
+```{r child = 'data_exp_viz.Rmd'}
+```
+
+```{r child = 'data_modeling1.Rmd'}
+```
+
+```{r child = 'impl_joel.Rmd'}
+```
+
+```{r child = 'impl_victor.Rmd'}
+```
+
+```{r child = 'impl_calvin.Rmd'}
+```
+
+```{r child = 'impl_gavin.Rmd'}
+```
+
+## XGBoost Model Implementation
+
+- We trained the model on the top 15 features and see from the validation loss curve (plateauing) that the model is not overfitting. From the confusion matrix we see expectedly, that model confuses less between budget and premium category. The Recall, Precision and F1 scores are strong showing good confidence in model's predictive power.
+
+```{r child = 'impl_subhamay.Rmd'}
+```
+
+# Results
+
+We evaluated five machine learning algorithms to answer our research question: To what extent can machine learning identify key differentiators between Budget, Standard, and Premium Airbnb listings in Melbourne?
+
+```{r performance}
+# Create a table comparing 5 models
+model_eval <- tibble(
+  Model = c("KNN", "SVM", "Random Forest", "MultiClass Logisitic Regression", "XGBoost"),
+  
+  # Hyperparameters as a string for readability
+  Hyperparameters = c(
+    "neighbors=45, dist_powe=1",
+    "C=1, gamma=0.001, kernel='rbf'",
+    "mtry=16, trees = 2000, min_n = 5",
+    "alpha=0.01, l1_ratio=0.5",
+    hyperparameters_subhamay
+  ),
+  
+  Accuracy = c(0.710, 0.780, 0.763, 0.711, 0.762),
+  F1_Score    = c(0.710, 0.765, 0.766, 0.715, 0.763),
+  ROC_AUC   = c(0.825, 0.856, 0.910, 0.866, 0.904)
+)
+
+# Round metrics for readability
+model_eval <- model_eval %>%
+  mutate(
+    Accuracy = round(Accuracy, 3),
+    F1_Score    = round(F1_Score, 3),
+    ROC_AUC        = round(ROC_AUC, 3)
+  )
+
+# Create GT table
+model_eval %>%
+  gt() %>%
+  fmt_number(
+    columns = vars(Accuracy, F1_Score, ROC_AUC),
+    decimals = 3
+  ) %>%
+  cols_label(
+    Model = "Model",
+    Hyperparameters = "Hyperparameters",
+    Accuracy = "Accuracy",
+    F1_Score = "F1-Score",
+    ROC_AUC = "ROC_AUC"
+  ) %>%
+  tab_options(
+    table.font.size = 11,
+    data_row.padding = px(4)
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels(everything())
+  ) %>%
+  opt_align_table_header("center")
+```
+
+Machine learning models successfully identified price tier differentiators with a classification accuracy of 78 percent. The Support Vector Machine (SVM) achieved the best overall performance, reaching 78.0 percent accuracy. The Random Forest model exhibited the strongest discrimination capability with a 91.0 percent ROC AUC, indicating excellent ability to distinguish between tiers, and also provided the most balanced performance with a 76.6 percent F1-score, reflecting a solid precision-recall balance. All models substantially outperformed the random guessing baseline of 33.3 percent for three classes. Overall, the 78 percent accuracy demonstrates that machine learning can reliably identify price tier patterns, highlighting its potential for practical real-world applications. The performance gap between the SVM (78 percent accuracy) and k-NN (71 percent accuracy) further suggests that capturing non-linear relationships and effectively handling high-dimensional data are key factors in achieving superior results.
+
+### Conclusion
+The most influential factors in determining price tiers are primarily property-related, accounting for 81 percent of the model’s overall importance. The top three property characteristics are room type (entire home versus private room), capacity features such as the number of guests accommodated, bedrooms, and beds, and pricing structure elements including cleaning fees and guest policies. Interestingly, host characteristics—such as tenure, superhost status, and response rate—contribute only 5 percent to total importance. This finding suggests that new hosts can effectively compete in premium market segments by prioritizing property quality and amenities rather than relying on long-term experience or reputation.
+
+Machine learning successfully answers our research question: We can identify price tier differentiators with 78% accuracy, and the most influential drivers are property capacity, room type, and amenities—not host experience. This finding democratizes the premium market for new hosts and provides actionable insights for Australia's $4.8B short-term rental industry.
+The practical implication is clear: hosts should invest in property quality (bedrooms, amenities, capacity) rather than waiting years to build reputation. For a competitive market facing -12% occupancy declines in Sydney, these data-driven insights enable strategic decision-making that can directly impact revenue optimization.
+
+### Limitations and Future work
+This study has several limitations that should be noted. Its geographic scope is restricted to a single city, Melbourne, which means the findings may not generalize to other cities such as Sydney or to regional areas. The temporal scope covers only one point in time (December 2018), so seasonal patterns and market fluctuations are not captured. Review sentiment was not incorporated, which would require natural language processing; and neighborhood-level details such as walkability or transit accessibility were unavailable.
+
+Future work can address these gaps through several directions. Expanding the geographic scope to cities like Sydney and Brisbane would help assess generalizability, while analyzing multi-year data could reveal seasonal and longitudinal market trends. More advanced extensions include applying deep learning (using convolutional neural networks) to extract visual quality signals from property photos, using NLP-based sentiment analysis on reviews and descriptions, implementing causal inference via A/B testing to measure the true return on investment of amenity enhancements, and adopting dynamic modeling frameworks to update price tier predictions in real time based on market demand.
+
+```{r child = 'appendix.Rmd'}
+```

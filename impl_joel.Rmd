@@ -1,0 +1,254 @@
+---
+title: "impl_joel"
+output: html_document
+---
+
+```{r, include=FALSE}
+library(dplyr)
+library(caret)
+library(e1071)
+library(ggplot2)
+library(doParallel)
+library(recipes)
+library(gridExtra)
+library(patchwork)
+library(grid)
+library(tidymodels)
+
+# Detect available cores
+cores <- detectCores()
+cl <- makeCluster(cores - 1)  # leave 1 core free
+registerDoParallel(cl)
+
+set.seed(5003)
+data.train <- read.csv("df_train.csv")
+data.test <- read.csv("df_test.csv")
+
+data.train <- data.train %>%
+    mutate(across(where(is.character), as.factor))
+numerics <- sapply(data.train, is.numeric)
+df_numeric <- data.train[, numerics]
+df_numeric <- df_numeric %>%
+    mutate(across(everything(), ~ifelse(is.na(.), median(., na.rm = TRUE), .)))
+
+
+#find the number of pca components from the training set
+pca_res <- prcomp(df_numeric, center=T, scale. = T)
+component_var <- summary(pca_res)$importance[3,]
+n_components <- which(component_var >= 0.95)[1]
+#cat("Number of components that explains at least 95% variance", n_components)
+
+
+#preprocessing the data set function
+encode_and_reduce <- function(data, n_components) {
+  data <- data %>%
+    mutate(across(where(is.character), as.factor))
+  
+  numerics <- sapply(data, is.numeric)
+  df_numeric <- data[, numerics]
+  
+  df_numeric <- df_numeric %>%
+    mutate(across(everything(), ~ifelse(is.na(.), median(., na.rm = TRUE), .)))
+  
+  df_char <- data.train[, !numerics]
+  df_char <- data.frame(lapply(df_char, as.factor))
+  df_char <- df_char[, sapply(df_char, function(x) length(unique(x)) > 1)]
+
+  df_pt <- df_char$price_tier
+  df_char <- df_char %>% select(-price_tier)
+  
+  rec <- recipe(~ ., data = df_char) %>%
+    step_dummy(all_nominal(), all_logical())
+  
+  rec_prep <- prep(rec)
+  df_char_encoded <- bake(rec_prep, new_data=NULL)
+  df_char_encoded <- cbind(df_char_encoded, price_tier=df_pt)
+  
+  # PCA on numeric features
+  pca_df <- as.data.frame(pca_res$x[, 1:n_components])
+  process_df <- cbind(df_char_encoded, pca_df)
+  nzv <- nearZeroVar(process_df, saveMetrics = TRUE)
+  process_df <- process_df[, !nzv$nzv]
+  
+  return(process_df)
+}
+
+process.train <- encode_and_reduce(data.train, n_components)
+process.test <- encode_and_reduce(data.test, n_components)
+```
+## Support Vector Machine
+
+Nested Cross-Validation to find the best hyperparameters for support vector machine model
+ - Having the outer folds of the nested cross validation for getting the mean accuracy of the model
+ - The inner cross validation will be used to find the best hyperparameter (sigma and cost(C)) for the SVM model to perform at its best
+ - The k-Folds architecture will be using a 5-fold CV architecture for the outer cross validation and a 3-fold CV architecture for the hyperparameter tuning of the SVM model
+```{r setup1, message=FALSE, warning=FALSE, echo=TRUE}
+# If tuning results exist, skip model training and load directly
+if (file.exists("svm_tune_res.rds")) {
+  #cat("✅ Loading saved SVM tuning results...\n")
+  svm_results <- readRDS("svm_tune_res.rds")
+  final_svm <- svm_results$final_model
+  tune_results <- svm_results$tune_results
+  best.params <- svm_results$best_params
+} else {
+  #cat("⚙️ Running SVM hyperparameter tuning (first run — may take several minutes)...\n")
+  
+  outer_folds <- createFolds(process.train$price_tier, k = 5, list = TRUE, returnTrain = TRUE)
+  tune_grid <- expand.grid(
+    C = c(0.1, 1, 10),
+    sigma = c(0.001, 0.01, 0.1)
+  )
+  
+  for (i in seq_along(outer_folds)) {
+    train_idx <- outer_folds[[i]]
+    train_data <- process.train[train_idx, ]
+    test_data  <- process.train[-train_idx, ]
+    
+    train_control <- trainControl(
+      method = "cv",
+      number = 3,
+      allowParallel = TRUE
+    )
+    
+    svm_tune <- train(
+      price_tier ~ ., 
+      data = train_data,
+      method = "svmRadial",
+      metric = "Accuracy",
+      tuneGrid = tune_grid,
+      trControl = train_control,
+      preProcess = c("center", "scale"),
+      tuneLength = 5
+    )
+    
+    preds <- predict(svm_tune, newdata = test_data)
+    cat("Fold", i, "completed.\n")
+  }
+  
+  # Stop parallel backend
+  stopCluster(cl)
+  registerDoSEQ()
+  
+  tune_results <- svm_tune$results
+  best.params <- svm_tune$bestTune
+  
+  # Fit final SVM with best params
+  final_svm <- svm(
+    price_tier ~ .,
+    data = process.train,
+    kernel = "radial",
+    cost = best.params$C,
+    gamma = best.params$sigma
+  )
+  
+  svm_results <- list(
+    tune_results = tune_results,
+    best_params = best.params,
+    final_model = final_svm
+  )
+  
+  saveRDS(svm_results, file = "svm_tune_res.rds")
+  #cat("💾 SVM tuning complete and saved to svm_tune_res.rds\n")
+}
+```
+
+```{r svm_plots, warning=FALSE, echo=TRUE}
+svm_results <- readRDS("svm_tune_res.rds")
+final_svm <- svm_results$final_model
+tune_results <- svm_results$tune_results
+preds <- predict(final_svm, newdata = process.test)
+plt1 <- ggplot(tune_results, aes(x = C, y = Kappa, color = factor(sigma))) +
+  geom_line() +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(
+    title = "SVM Hyperparameter Performance Comparision",
+    x = "C (Regularization parameter)",
+    y = "Kappa",
+    color = "Sigma"
+  )+
+  theme_minimal(base_size = 10) +  # Reduced base size for grid layout
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 10),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 8),
+    axis.title = element_text(size = 9),
+    axis.text = element_text(size = 8),
+    axis.line = element_line(color = "black"),
+    panel.grid = element_blank()
+  )
+
+cm <- confusionMatrix(preds, process.test$price_tier)
+
+cm_df <- as.data.frame(cm$table)
+
+# Build results table
+results_table <- data.frame(
+  Class        = rownames(cm$byClass),
+  Accuracy     = cm$overall["Accuracy"],
+  Sensitivity  = cm$byClass[,"Sensitivity"],
+  Specificity  = cm$byClass[,"Specificity"],
+  Precision    = cm$byClass[,"Pos Pred Value"]
+)
+
+table <- ggplot() +
+  annotation_custom(
+    grob = tableGrob(
+      results_table,
+      rows = NULL
+    )
+  ) +
+  theme_void() +
+  labs(
+    title = "Classification Report"
+  ) +
+  theme(
+    plot.title = element_text(
+      size = 12, 
+      hjust = 0.5,
+      margin = margin(b = 5)
+    ),
+    plot.subtitle = element_text(
+      size = 11,
+      hjust = 0.5,
+      margin = margin(b = 10)
+    ),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+
+plt2 <- ggplot(cm_df, aes(Prediction, Reference, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "black", size = 5) +
+  scale_fill_gradient(low = "white", high = "blue") +
+  labs(title = "SVM Confusion Matrix",
+       x = "Predicted",
+       y = "Actual") +
+  theme_minimal(base_size=10) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 12),
+    axis.title = element_text(size = 9),
+    axis.text = element_text(size = 8),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 7)
+  )
+
+(plt1 | plt2) / (table) +
+  plot_annotation(
+    title = "SVM Model Performance Summary",
+    theme = theme(
+      plot.title = element_text(size = 12, face = "bold", hjust = 0.5)
+    )
+  )
+```
+
+From the metric table we find that when our model is tested on the test data that is processed using the training data we find the following information:
+ * The SVM model with a C = 1 and gamma = 0.001, gives an accuracy of average 78% for all the three price tiers
+ * We can also see how well the model performs for identifying each of the three price tiers
+  - We see that the average sensitivity of the model on the test data is very high (averaging around 79%), implying that the model can identify the actual positives for each class correctly. But we see a major dip in sensitivity quality of the model for standard class data, this issue can be correlated with the idea implying in the data exploration section showing that some of the Premium/Budget properties may be considered as Standard property when it is not due to some correlated features that was missed out during data cleaning.
+  - We see that the average specificity of the model on the test data is also very high (averaging 89%), impying that the model has a fairly good performance in determining actual negatives/incorrect classes of the training set correctly. 
+  - Overall we see that the model performs fairly decent in regards to overall model accuracy, precision and specificity of the model.
+ * From the confusion matrix created, we can further understand the quality of our model, we see that the SVM model using a radial kernel is able to accurate predict the Budget, Premium and Standard priced houses but we also see that about 950 Standard houses were misclassified as Budget houses and 780 Premium houses were classified as Standard houses, this shows that some of the features have some non-linear correlation with each other that is not identified by the SVM model and hence were unable to create a proper boundary
+ * But overall we see that the vast majority of the input test data was correctly identified as its appropriate price class.
+

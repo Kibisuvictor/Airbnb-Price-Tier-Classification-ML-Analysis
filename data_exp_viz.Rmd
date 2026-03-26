@@ -1,0 +1,147 @@
+# Data Exploration and Visualization
+
+## Loading Datasets
+
+- Here we loaded both the cleaned and uncleaned datasets to visually understand the different results and challenges the uncleaned dataset has posed in regards to solving the classification problem.
+```{r}
+library(tidyr)
+library(tidyverse)
+library(dplyr)
+
+unclean_airbnb_df = read.csv("airbnb_data.csv")
+airbnb_df <- read.csv("dataset_cleaned_2.csv")
+```
+
+## Data Analysis  
+
+### Data visualization
+
+```{r}
+library(ggplot2)
+library(visdat)
+library(patchwork)
+library(ggthemes)
+
+unclean_airbnb_df$price_tier <- as.factor(unclean_airbnb_df$price_tier)
+
+p1 <- ggplot(airbnb_df, aes(x = price_tier, fill=price_tier)) + 
+  geom_bar()+
+  labs(title="Distribution of the price tier (target variable)", x="Price Tier", y="Frequency") + theme_minimal()
+
+
+p2 <- ggplot(airbnb_df, aes(x = price_tier, y = beds, fill = price_tier)) + geom_boxplot()+ 
+  labs(title="Distribution of number of beds across price tier ", x="Price Tier", y="Number of beds") + theme_minimal() + theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(size = 12)
+  )
+
+p1 + p2
+```
+- Here we see that the target class of our dataset are relatively balanced showing that there is an equal distribution of houses available to rent in the Airbnb Melbourne site. Another very informative plot is the boxplot that can be seen it shows the distribution of number of beds across the type of houses which shows that premium houses seem to have a higher median number of beds as compared to the other 2 types. 
+```{r}
+p3 <- ggplot(airbnb_df, aes(x = price_tier, y = accommodates, fill = price_tier)) + geom_boxplot()+ 
+  labs(title="Variation in Accommodation Capacity Across Price Tiers", x="Price Tier", y="Accomodation capacity") + theme_tufte(base_size = 14, base_family = "serif") + theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(size = 12)
+  )
+
+
+p4 <- ggplot(airbnb_df, aes(x = price_tier, y = cleaning_fee, fill = price_tier)) + geom_boxplot()+ 
+  labs(title="Variation in cleaning fee Across Price Tiers", x="Price Tier", y="Cleaning fee") + theme_tufte(base_size = 14, base_family = "serif") + theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(size = 12)
+  )
+
+
+p3 + p4
+```
+
+Variation in accommodation capacity and cleaning fees across price tiers. Budget listings typically accommodate 1–2 guests and have little or no cleaning fees. Standard listings accommodate slightly more guests and charge modest cleaning fees. Premium listings accommodate the largest number of guests (median ≈ 4) and show higher and more variable cleaning fees, with some extreme outliers. Overall, higher price tiers are associated with greater guest capacity and higher cleaning charges.
+
+## Analysis of Correlation between features
+
+#### Uncleaned Dataset
+
+```{r fig.width=12, fig.height=5}
+library(corrplot)
+library(ggplot2)
+library(patchwork)
+library(reshape2)
+
+og_price_tier_unclean <- unclean_airbnb_df$price_tier
+og_price_tier_clean <- airbnb_df$price_tier
+unclean_airbnb_df$price_tier <- as.numeric(as.factor(unclean_airbnb_df$price_tier)) - 1
+airbnb_df$price_tier <- as.numeric(as.factor(airbnb_df$price_tier)) - 1
+
+num_features <- unclean_airbnb_df[sapply(unclean_airbnb_df, is.numeric)]
+num_features <- num_features[, apply(num_features, 2, function(x) {
+  var(x, na.rm = TRUE) > 0
+})]
+corr_mat1 <- cor(num_features, use="pairwise.complete.obs")
+corr_mat1_mod <- abs(corr_mat1)
+diag(corr_mat1_mod) <- 0
+top_features <- names(sort(apply(corr_mat1_mod, 2, max), decreasing = TRUE))[1:30]
+top_features <- c(top_features, "price_tier")
+top_corr_mat1 <- corr_mat1[top_features, top_features]
+corr_df_top1 <- melt(top_corr_mat1)
+
+num_features1 <- airbnb_df[sapply(airbnb_df, is.numeric)]
+corr_mat2 <- cor(num_features1, use="pairwise.complete.obs")
+corr_mat2_mod <- abs(corr_mat2)
+diag(corr_mat2_mod) <- 0
+top_features <- names(sort(apply(corr_mat2_mod, 2, max), decreasing = TRUE))[1:27]
+top_features <- c(top_features, "price_tier")
+top_corr_mat2 <- corr_mat2[top_features, top_features]
+corr_df_top2 <- melt(top_corr_mat2)
+
+# Plot 1 - Before Cleaning
+p1 <- ggplot(corr_df_top1, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", 
+                       midpoint = 0, limit = c(-1, 1), name = "Correlation") +
+  theme_minimal(base_size = 10) +  # base_size adjusts all text
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 8),
+    axis.ticks = element_blank()
+  ) +
+  labs(title = "Correlated Features + Price Tier Before Cleaning", x = NULL, y = NULL) + coord_fixed()
+
+# Plot 2 - After Cleaning
+p2 <- ggplot(corr_df_top2, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", 
+                       midpoint = 0, limit = c(-1, 1), guide = "none") +
+  theme_minimal(base_size = 10) +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 8),
+    axis.ticks = element_blank()
+  ) +
+  labs(title = "Correlated Features + Price Tier After Cleaning", x = NULL, y = NULL) + coord_fixed()
+
+# Combine side by side
+p1 + p2
+airbnb_df$price_tier <- factor(airbnb_df$price_tier, 
+                              levels = c(0, 1, 2),
+                              labels = c("Budget", "Standard", "Premium"))
+```
+
+
+- In the uncleaned dataset, many features exhibit weak correlations with one another, this makes interpretation of their relations often difficult to understand. This is most likely due to factors like missing values, inconsistencies or outliers, which can negatively distort the correlation estimates.
+- After the data cleaning and removal process for features with majority of its values missing, the correlation matrix has become a bit more interpretable. The remaining features display stronger correlations compared to the uncleaned heatmap, faciliating the identification of key patterns and aiding in dimensionality reduction techniques, such as PCA.
+- Features exhibiting correlation with the target variables are likely to be important predictors and should be treated with particular care, even when they are also correlated with other features. These influential features can be clearly seen to increase in the cleaned dataset as compared to the uncleaned one, where the top 20 correlated features are not that correlated to the target feature as compared to the top 20 features of the cleaned dataset. 
+
+### PCA Analysis to understand Class Separation
+```{r}
+library(ggfortify)
+pca <- prcomp(num_features1, scale=TRUE)
+autoplot(pca, data=airbnb_df, colour="price_tier") +
+  ggtitle("PCA Projection of Features into 2 components")
+```
+- This PCA analysis highlights the difficulty in class separation. This visualization shows us clearly how all the three tier housing are extremely close to each other even while considering only 2 principal components, so simple linear algorithms like Logistic Regression and LDA may not be the most appropriate models to separate the classes from each other. This added complexity of the dataset further compels the dataset to undergo more cleaning other than just handling missing data such as outlier analysis, dimensionality reduction or handling missing data again using other machine learning models/bootstrap.
+
+

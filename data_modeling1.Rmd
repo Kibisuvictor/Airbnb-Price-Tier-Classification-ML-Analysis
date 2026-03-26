@@ -1,0 +1,29 @@
+# Modeling
+This report presents a comprehensive comparison of five machine learning approaches for classifying Melbourne Airbnb listings into price tiers (Budget, Standard, Premium):
+
+1. **Random Forest** - Ensemble of decision trees
+2. **XGBoost** - Gradient boosted trees
+3. **Multinomial Logistic Regression with Elastic Net** - Regularized linear model
+4. **k-Nearest Neighbors** - Instance-based learning
+5. **Support Vector Machine with PCA** - Kernel-based with dimensionality reduction. And we will use **Accuracy**, **F1-score**, **sensitivity**, **confusion matrix** and **specificity** as some of our evaluation metrics together with **hyperaparameter tuning** and **cross validation** to get the best combination of parameters for the models. 
+
+```{r load-data, include=FALSE}
+# Load preprocessed data
+df_train <- read_csv("df_train.csv", show_col_types = FALSE)
+df_test <- read_csv("df_test.csv", show_col_types = FALSE)
+
+# Ensure proper data types
+df_train <- df_train %>%
+  mutate(
+    price_tier = factor(price_tier, levels = c("Budget", "Standard", "Premium")),
+    across(where(is.character), as.factor)
+  )
+
+df_test <- df_test %>%
+  mutate(
+    price_tier = factor(price_tier, levels = c("Budget", "Standard", "Premium")),
+    across(where(is.character), as.factor)
+  )
+```
+
+**Dataset:** `r nrow(df_train)` training observations, `r nrow(df_test)` test observations, `r ncol(df_train)-1` features

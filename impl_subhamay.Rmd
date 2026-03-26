@@ -1,0 +1,1034 @@
+---
+title: "XGBoost Price Tier Classification"
+output: html_document
+---
+
+```{r, echo=TRUE, eval=FALSE}
+# ============================================================================
+# SETUP AND CONFIGURATION
+# ============================================================================
+# Load required libraries for modeling, visualization, and evaluation
+library(xgboost)                    # Gradient boosting framework
+library(dplyr)                      # Data manipulation
+library(ggplot2)                    # Visualization
+library(tidyr)                      # Data reshaping
+library(caret)                      # Confusion matrix and evaluation metrics
+library(gt)                         # Publication-ready tables
+library(scales)                     # Color scales for plots
+library(ParBayesianOptimization)    # Bayesian hyperparameter tuning
+library(gridExtra)                  # Load gridExtra for table visualization
+library(patchwork)                  # Combine multiple plots
+
+# Set random seed for reproducibility across all operations
+set.seed(42)
+
+# ============================================================================
+# DATA LOADING AND PREPROCESSING
+# ============================================================================
+# Load training dataset from CSV file
+df <- read.csv("df_train_sub.csv", stringsAsFactors = FALSE)
+
+# Separate target variable (price_tier) from predictor features
+# Ensure target is a factor and trim any whitespace
+target <- factor(trimws(df$price_tier))
+features <- df %>% select(-price_tier)
+
+# Convert to numeric matrices required by XGBoost
+# XGBoost requires numeric labels starting from 0
+X <- as.matrix(features)
+y <- as.numeric(target) - 1  # Convert factor levels (1,2,3...) to (0,1,2...)
+
+# Create DMatrix object - XGBoost's internal data structure for efficiency
+dtrain <- xgb.DMatrix(data = X, label = y)
+
+# ============================================================================
+# FEATURE IMPORTANCE ANALYSIS
+# ============================================================================
+# Configuration: Number of top features to display in visualization
+TOP_N_FEATURES <- 15
+
+# Train a preliminary model to assess feature importance
+# This is a quick model with minimal rounds to get initial feature rankings
+quick_model <- xgb.train(
+  data = dtrain,
+  booster = "gbtree",                              # Tree-based boosting
+  objective = "multi:softprob",                    # Multi-class classification with probabilities
+  num_class = length(unique(y)),                   # Number of target classes
+  nrounds = 50,                                    # Moderate number of iterations
+  eval_metric = "mlogloss",                        # Multi-class log loss
+  verbose = 0                                      # Suppress training output
+)
+
+# Extract feature importance scores based on information gain
+# Gain: Total reduction in loss when feature is used for splitting
+importance_matrix <- xgb.importance(
+  feature_names = colnames(X), 
+  model = quick_model
+)
+
+# Select top N most important features for visualization
+importance_df <- importance_matrix[1:TOP_N_FEATURES, ]
+# Reverse factor levels for proper ordering in horizontal bar chart
+importance_df$Feature <- factor(
+  importance_df$Feature, 
+  levels = rev(importance_df$Feature)
+)
+
+# Create horizontal bar chart of feature importances
+p1 <- ggplot(importance_df, aes(x = Feature, y = Gain, fill = Gain)) +
+  geom_col() +
+  coord_flip() +  # Horizontal bars for better label readability
+  scale_fill_gradient(low = "#FFDDC1", high = "#FF5733") +
+  labs(
+    title = paste("Top", TOP_N_FEATURES, "Feature Importances"),
+    x = "Feature",
+    y = "Importance (Gain)"
+  ) +
+  theme_minimal(base_size = 10) +  # Reduced base size for grid layout
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 16),
+    axis.title = element_text(size = 9),
+    axis.text = element_text(size = 8),
+    panel.grid = element_blank()
+  )
+
+# ============================================================================
+# FEATURE SELECTION
+# ============================================================================
+# Define final feature set for model training
+# Selected based on domain knowledge and importance analysis
+train_features <- c(
+  "room_type",                    # Type of accommodation
+  "bedrooms",                     # Number of bedrooms
+  "longitude",                    # Geographic coordinate
+  "accommodates",                 # Maximum guest capacity
+  "latitude",                     # Geographic coordinate
+  "availability_flexibility",     # Booking flexibility score
+  "review_stability",             # Review consistency metric
+  "bathrooms",                    # Number of bathrooms
+  "cleaning_fee",                 # Cleaning fee amount
+  "extra_people",                 # Fee per additional guest
+  "property_type",                # Property category
+  "calendar_updated",             # Recency of calendar updates
+  "amenities",                    # Number/quality of amenities
+  "number_of_reviews",            # Total review count
+  "guests_included"               # Base number of included guests
+)
+
+# Extract selected features and recreate matrices
+features <- df[, train_features]
+X <- as.matrix(features)
+
+# Recreate DMatrix with reduced feature set
+dtrain <- xgb.DMatrix(data = X, label = y)
+
+# ============================================================================
+# HYPERPARAMETER OPTIMIZATION (BAYESIAN OPTIMIZATION)
+# ============================================================================
+# Define objective function for Bayesian optimization
+# This function evaluates a set of hyperparameters via cross-validation
+# Returns: negative log loss (for maximization) and optimal number of rounds
+scoringFunction <- function(eta, max_depth, gamma, colsample_bytree, 
+                           min_child_weight, subsample) {
+  
+  # Progress tracking during optimization
+  cat("Testing: eta =", eta, "| max_depth =", max_depth, "\n")
+  flush.console()
+
+  # Configure XGBoost parameters for current evaluation
+  params <- list(
+    booster = "gbtree",                            # Tree-based model
+    objective = "multi:softprob",                  # Multi-class probabilities
+    num_class = length(unique(y)),                 # Number of classes
+    eval_metric = "mlogloss",                      # Evaluation metric
+    eta = eta,                                     # Learning rate (shrinkage)
+    max_depth = as.integer(max_depth),            # Maximum tree depth
+    gamma = gamma,                                 # Min loss reduction for split
+    colsample_bytree = colsample_bytree,          # Feature sampling per tree
+    min_child_weight = min_child_weight,          # Min sum of weights in leaf
+    subsample = subsample,                         # Row sampling per tree
+    nthread = 6                                    # Parallel threads
+  )
+
+  # Perform 3-fold stratified cross-validation
+  cv <- xgb.cv(
+    params = params,
+    data = dtrain,
+    nrounds = 300,                                 # Max boosting rounds
+    nfold = 3,                                     # Number of CV folds
+    stratified = TRUE,                             # Maintain class distribution
+    verbose = 0,                                   # Suppress output
+    early_stopping_rounds = 3                      # Stop if no improvement
+  )
+
+  # Return negative log loss (Bayesian opt maximizes, we want to minimize loss)
+  list(
+    Score = -min(cv$evaluation_log$test_mlogloss_mean),
+    nrounds = cv$best_iteration
+  )
+}
+
+# Define hyperparameter search space bounds
+bounds <- list(
+  eta = c(0.01, 0.05),                    # Learning rate range
+  max_depth = c(3L, 6L),                  # Tree depth range
+  gamma = c(0, 5),                        # Regularization parameter
+  colsample_bytree = c(0.5, 1.0),        # Feature sampling ratio
+  min_child_weight = c(2, 5),            # Minimum leaf weight
+  subsample = c(0.5, 1.0)                # Row sampling ratio
+)
+
+# Execute Bayesian optimization
+# Uses Gaussian Process to intelligently explore hyperparameter space
+opt_result <- bayesOpt(
+  FUN = scoringFunction,
+  bounds = bounds,
+  initPoints = 10,                        # Random initialization points
+  iters.n = 20,                           # Optimization iterations
+  acq = "ei"                              # Expected Improvement acquisition
+)
+
+# Extract and display best hyperparameters found
+best_params <- getBestPars(opt_result)
+print(best_params)
+
+# Save optimization results for future use
+saveRDS(opt_result, file = "opt_result_sub.rds")
+
+# ============================================================================
+# FINAL MODEL TRAINING
+# ============================================================================
+# Load previously optimized hyperparameters
+opt_result <- readRDS("opt_result_sub.rds")
+best_params <- getBestPars(opt_result)
+
+# Create train/validation split (80/20)
+set.seed(42)
+train_idx <- sample(seq_len(nrow(X)), size = 0.8 * nrow(X))
+
+# Split features and labels
+X_train <- X[train_idx, ]
+y_train <- y[train_idx]
+X_val   <- X[-train_idx, ]
+y_val   <- y[-train_idx]
+
+# Create DMatrix objects for training and validation sets
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+dval   <- xgb.DMatrix(data = X_val, label = y_val)
+
+# Set up watchlist to monitor performance on both sets during training
+watchlist <- list(train = dtrain, eval = dval)
+
+# Train final model with optimized hyperparameters
+final_model <- xgb.train(
+  params = list(
+    booster = "gbtree",
+    objective = "multi:softprob",
+    num_class = length(unique(y)),
+    eval_metric = "mlogloss",
+    eta = best_params$eta,
+    max_depth = best_params$max_depth,
+    gamma = best_params$gamma,
+    colsample_bytree = best_params$colsample_bytree,
+    min_child_weight = best_params$min_child_weight,
+    subsample = best_params$subsample
+  ),
+  data = dtrain,
+  nrounds = 300,                          # Maximum training rounds
+  watchlist = watchlist,                  # Track train and validation metrics
+  verbose = 1,                            # Show progress
+  print_every_n = 100                     # Print every 100 rounds
+)
+
+# Save trained model to disk
+xgb.save(final_model, "xgb_trained_model.model")
+
+# ============================================================================
+# TRAINING VISUALIZATION
+# ============================================================================
+# Extract training history from model
+log_df <- as.data.frame(final_model$evaluation_log)
+
+# Identify best iteration (minimum validation loss)
+best_iter <- which.min(log_df$eval_mlogloss)
+best_loss <- log_df$eval_mlogloss[best_iter]
+
+# Detect plateau point (no improvement for 10 consecutive rounds)
+# This helps identify when early stopping should have occurred
+plateau_iter <- NA
+for (i in seq(best_iter, nrow(log_df) - 10)) {
+  if (all(log_df$eval_mlogloss[i:(i + 9)] > log_df$eval_mlogloss[i - 1])) {
+    plateau_iter <- i
+    break
+  }
+}
+
+# Create learning curve plot
+p2 <- ggplot(log_df, aes(x = iter)) +
+  geom_line(aes(y = train_mlogloss, color = "Train"), linewidth = 0.8) +
+  geom_line(aes(y = eval_mlogloss, color = "Validation"), linewidth = 0.8) +
+  # Mark best iteration with vertical line
+  geom_vline(
+    xintercept = best_iter,
+    linetype = "dashed",
+    color = "darkgreen",
+    linewidth = 0.8
+  ) +
+  # Highlight best point
+  geom_point(
+    data = data.frame(iter = best_iter, loss = best_loss),
+    aes(x = iter, y = loss),
+    color = "darkgreen",
+    size = 2
+  ) +
+  annotate(
+    "text",
+    x = best_iter, y = best_loss,
+    label = paste("Best:", best_iter),
+    hjust = -0.1, vjust = 1.2,
+    color = "darkgreen",
+    size = 3
+  ) +
+  labs(
+    title = "Training vs Validation Log Loss",
+    x = "Iteration",
+    y = "Log Loss"
+  ) +
+  scale_color_manual(values = c("Train" = "#FF5733", "Validation" = "#1E90FF")) +
+  theme_minimal(base_size = 10) +  # Reduced base size for grid layout
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 16),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 8),
+    axis.title = element_text(size = 9),
+    axis.text = element_text(size = 8),
+    axis.line = element_line(color = "black"),
+    panel.grid = element_blank()
+  )
+
+# ============================================================================
+# MODEL EVALUATION ON TEST SET
+# ============================================================================
+# Load trained model from disk
+loaded_model <- xgb.load("xgb_trained_model.model")
+
+# Load test dataset
+test_df <- read.csv("df_test_sub.csv", stringsAsFactors = FALSE)
+
+# Extract same features used during training (critical for consistency)
+features_test <- test_df[, train_features]
+X_test <- as.matrix(features_test)
+
+# Prepare true labels from test set
+target_test <- factor(trimws(test_df$price_tier))
+y_test <- as.numeric(target_test) - 1
+
+# Generate predictions on test set
+dtest <- xgb.DMatrix(data = X_test)
+pred_probs <- predict(loaded_model, dtest)
+
+# Convert probability vector to class predictions
+# pred_probs is returned as a flat vector, reshape to (n_samples x n_classes)
+n_classes <- length(levels(target_test))
+pred_matrix <- matrix(pred_probs, ncol = n_classes, byrow = TRUE)
+pred_class <- max.col(pred_matrix) - 1  # Get class with highest probability
+
+# Convert numeric predictions back to original factor labels
+pred_labels <- factor(
+  levels(target_test)[pred_class + 1], 
+  levels = levels(target_test)
+)
+
+# Generate confusion matrix and classification metrics
+cm <- confusionMatrix(pred_labels, target_test)
+
+# ============================================================================
+# CONFUSION MATRIX VISUALIZATION
+# ============================================================================
+# Convert confusion matrix to data frame for plotting
+cm_table <- as.data.frame(cm$table)
+colnames(cm_table) <- c("Predicted", "Actual", "Freq")
+
+# Create heatmap visualization of confusion matrix
+p3 <- ggplot(cm_table, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = Freq), size = 3.5, color = "black", fontface = "bold") +
+  scale_fill_gradient(low = "white", high = "#1E90FF") +
+  labs(
+    title = "Confusion Matrix - Test Set",
+    x = "Actual Price Tier",
+    y = "Predicted Price Tier",
+    fill = "Count"
+  ) +
+  theme_minimal(base_size = 10) +  # Reduced base size for grid layout
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title = element_text(size = 9),
+    axis.text = element_text(size = 8),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 7)
+  )
+
+# ============================================================================
+# DETAILED CLASSIFICATION REPORT
+# ============================================================================
+# Extract confusion matrix as numeric matrix
+cm_matrix <- as.matrix(cm$table)
+
+# Set class labels for rows and columns
+true_classes <- levels(target_test)
+rownames(cm_matrix) <- true_classes
+colnames(cm_matrix) <- true_classes
+
+# Calculate per-class performance metrics
+# For each class, compute Precision, Recall, and F1-Score
+metrics_list <- lapply(true_classes, function(cls) {
+  # Extract True/False Positives/Negatives for current class
+  TP <- cm_matrix[cls, cls]                      # Correctly predicted as class
+  FP <- sum(cm_matrix[cls, ]) - TP               # Incorrectly predicted as class
+  FN <- sum(cm_matrix[, cls]) - TP               # Missed predictions for class
+  TN <- sum(cm_matrix) - TP - FP - FN            # Correctly predicted as other
+  
+  # Calculate classification metrics
+  Precision <- ifelse((TP + FP) == 0, 0, TP / (TP + FP))  # Correct among predicted
+  Recall    <- ifelse((TP + FN) == 0, 0, TP / (TP + FN))  # Correct among actual
+  F1        <- ifelse((Precision + Recall) == 0, 0,       # Harmonic mean
+                     2 * Precision * Recall / (Precision + Recall))
+  Support   <- TP + FN                                     # Total samples in class
+  
+  data.frame(
+    Class = cls, 
+    Precision = Precision, 
+    Recall = Recall, 
+    F1 = F1, 
+    Support = Support
+  )
+})
+
+# Combine per-class metrics into single data frame
+metrics_df <- bind_rows(metrics_list)
+
+# Calculate overall accuracy
+total_support <- sum(metrics_df$Support)
+overall_accuracy <- sum(diag(cm_matrix)) / sum(cm_matrix)
+
+# Calculate macro average (unweighted mean across classes)
+macro_avg <- metrics_df %>%
+  summarise(
+    Precision = mean(Precision),
+    Recall = mean(Recall),
+    F1 = mean(F1),
+    Support = total_support
+  ) %>%
+  mutate(Class = "Macro Avg")
+
+# Calculate weighted average (weighted by class support)
+weighted_avg <- metrics_df %>%
+  summarise(
+    Precision = sum(Precision * Support) / total_support,
+    Recall = sum(Recall * Support) / total_support,
+    F1 = sum(F1 * Support) / total_support,
+    Support = total_support
+  ) %>%
+  mutate(Class = "Weighted Avg")
+
+wp_subhamay <- sum(metrics_df$Precision * metrics_df$Support) / total_support
+wr_subhamay <- sum(metrics_df$Recall * metrics_df$Support) / total_support
+wf_subhamay <- sum(metrics_df$F1 * metrics_df$Support) / total_support
+
+# Combine all metrics into final report
+report_df <- bind_rows(metrics_df, macro_avg, weighted_avg) %>%
+  mutate(across(where(is.numeric), ~ round(., 4)))
+
+# Format the data for display
+display_df <- report_df %>%
+  mutate(
+    Precision = sprintf("%.4f", Precision),
+    Recall = sprintf("%.4f", Recall),
+    F1 = sprintf("%.4f", F1)
+  )
+
+# Create theme for table
+table_theme <- ttheme_minimal(
+  base_size = 10,
+  core = list(
+    fg_params = list(hjust = 0.5, x = 0.5, fontface = "plain"),
+    bg_params = list(
+      fill = c(rep(c("#F8F9FA", "#FFFFFF"), length.out = nrow(display_df) - 2),
+               "#E8F4F8", "#E8F4F8")  # Light blue for summary rows
+    )
+  ),
+  colhead = list(
+    fg_params = list(fontface = "bold", fontsize = 11),
+    bg_params = list(fill = "#1E90FF", col = "white")
+  ),
+  rowhead = list(
+    fg_params = list(hjust = 0.5, x = 0.5, fontface = "plain")
+  )
+)
+
+# Convert to ggplot table
+p4 <- ggplot() +
+  annotation_custom(
+    grob = tableGrob(
+      display_df,
+      rows = NULL,
+      theme = table_theme
+    )
+  ) +
+  theme_void() +
+  labs(
+    title = "Classification Report",
+    subtitle = paste("Overall Accuracy:", round(overall_accuracy, 4))
+  ) +
+  theme(
+    plot.title = element_text(
+      size = 16, 
+      face = "bold", 
+      hjust = 0.5,
+      margin = margin(b = 5)
+    ),
+    plot.subtitle = element_text(
+      size = 11,
+      hjust = 0.5,
+      face = "bold",
+      margin = margin(b = 10)
+    ),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+# ============================================================================
+# COMBINED VISUALIZATION GRID
+# ============================================================================
+# Combine all visualizations into 2x2 grid using patchwork
+# Layout: Feature Importance | Training Curves
+#         Confusion Matrix   | Classification Report
+(p1 | p2) / (p3 | p4) +
+  plot_annotation(
+    title = "XGBoost Model Performance Summary",
+    theme = theme(
+      plot.title = element_text(size = 20, face = "bold", hjust = 0.5)
+    )
+  )
+```
+
+```{r, echo=FALSE, message = FALSE, warning = FALSE, eval=TRUE, results='hide'}
+# ============================================================================
+# SETUP AND CONFIGURATION
+# ============================================================================
+# Load required libraries for modeling, visualization, and evaluation
+library(xgboost)                    # Gradient boosting framework
+library(dplyr)                      # Data manipulation
+library(ggplot2)                    # Visualization
+library(tidyr)                      # Data reshaping
+library(caret)                      # Confusion matrix and evaluation metrics
+library(gt)                         # Publication-ready tables
+library(scales)                     # Color scales for plots
+library(ParBayesianOptimization)    # Bayesian hyperparameter tuning
+library(gridExtra)                  # Load gridExtra for table visualization
+library(patchwork)                  # Combine multiple plots
+
+# Set random seed for reproducibility across all operations
+set.seed(42)
+
+# ============================================================================
+# DATA LOADING AND PREPROCESSING
+# ============================================================================
+# Load training dataset from CSV file
+df <- read.csv("df_train_sub.csv", stringsAsFactors = FALSE)
+
+# Separate target variable (price_tier) from predictor features
+# Ensure target is a factor and trim any whitespace
+target <- factor(trimws(df$price_tier))
+features <- df %>% select(-price_tier)
+
+# Convert to numeric matrices required by XGBoost
+# XGBoost requires numeric labels starting from 0
+X <- as.matrix(features)
+y <- as.numeric(target) - 1  # Convert factor levels (1,2,3...) to (0,1,2...)
+
+# Create DMatrix object - XGBoost's internal data structure for efficiency
+dtrain <- xgb.DMatrix(data = X, label = y)
+
+# ============================================================================
+# FEATURE IMPORTANCE ANALYSIS
+# ============================================================================
+# Configuration: Number of top features to display in visualization
+TOP_N_FEATURES <- 15
+
+# Train a preliminary model to assess feature importance
+# This is a quick model with minimal rounds to get initial feature rankings
+quick_model <- xgb.train(
+  data = dtrain,
+  booster = "gbtree",                              # Tree-based boosting
+  objective = "multi:softprob",                    # Multi-class classification with probabilities
+  num_class = length(unique(y)),                   # Number of target classes
+  nrounds = 50,                                    # Moderate number of iterations
+  eval_metric = "mlogloss",                        # Multi-class log loss
+  verbose = 0                                      # Suppress training output
+)
+
+# Extract feature importance scores based on information gain
+# Gain: Total reduction in loss when feature is used for splitting
+importance_matrix <- xgb.importance(
+  feature_names = colnames(X), 
+  model = quick_model
+)
+
+# Select top N most important features for visualization
+importance_df <- importance_matrix[1:TOP_N_FEATURES, ]
+# Reverse factor levels for proper ordering in horizontal bar chart
+importance_df$Feature <- factor(
+  importance_df$Feature, 
+  levels = rev(importance_df$Feature)
+)
+
+# Create horizontal bar chart of feature importances
+p1 <- ggplot(importance_df, aes(x = Feature, y = Gain, fill = Gain)) +
+  geom_col() +
+  coord_flip() +  # Horizontal bars for better label readability
+  scale_fill_gradient(low = "#FFDDC1", high = "#FF5733") +
+  labs(
+    title = paste("Top", TOP_N_FEATURES, "Feature Importances"),
+    x = "Feature",
+    y = "Importance (Gain)"
+  ) +
+  theme_minimal(base_size = 10) +  # Reduced base size for grid layout
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 16),
+    axis.title = element_text(size = 9),
+    axis.text = element_text(size = 8),
+    panel.grid = element_blank()
+  )
+
+# ============================================================================
+# FEATURE SELECTION
+# ============================================================================
+# Define final feature set for model training
+# Selected based on domain knowledge and importance analysis
+train_features <- c(
+  "room_type",                    # Type of accommodation
+  "bedrooms",                     # Number of bedrooms
+  "longitude",                    # Geographic coordinate
+  "accommodates",                 # Maximum guest capacity
+  "latitude",                     # Geographic coordinate
+  "availability_flexibility",     # Booking flexibility score
+  "review_stability",             # Review consistency metric
+  "bathrooms",                    # Number of bathrooms
+  "cleaning_fee",                 # Cleaning fee amount
+  "extra_people",                 # Fee per additional guest
+  "property_type",                # Property category
+  "calendar_updated",             # Recency of calendar updates
+  "amenities",                    # Number/quality of amenities
+  "number_of_reviews",            # Total review count
+  "guests_included"               # Base number of included guests
+)
+
+# Extract selected features and recreate matrices
+features <- df[, train_features]
+X <- as.matrix(features)
+
+# Recreate DMatrix with reduced feature set
+dtrain <- xgb.DMatrix(data = X, label = y)
+
+# ============================================================================
+# FINAL MODEL TRAINING
+# ============================================================================
+# Load previously optimized hyperparameters
+opt_result <- readRDS("opt_result_sub.rds")
+best_params <- getBestPars(opt_result)
+hyperparameters_subhamay <- paste0(
+  names(best_params), "=", 
+  ifelse(sapply(best_params, is.numeric), sprintf("%.2f", best_params), best_params), 
+  collapse = ", "
+)
+
+# Create train/validation split (80/20)
+set.seed(42)
+train_idx <- sample(seq_len(nrow(X)), size = 0.8 * nrow(X))
+
+# Split features and labels
+X_train <- X[train_idx, ]
+y_train <- y[train_idx]
+X_val   <- X[-train_idx, ]
+y_val   <- y[-train_idx]
+
+# Create DMatrix objects for training and validation sets
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+dval   <- xgb.DMatrix(data = X_val, label = y_val)
+
+# Set up watchlist to monitor performance on both sets during training
+watchlist <- list(train = dtrain, eval = dval)
+
+# Train final model with optimized hyperparameters
+final_model <- xgb.train(
+  params = list(
+    booster = "gbtree",
+    objective = "multi:softprob",
+    num_class = length(unique(y)),
+    eval_metric = "mlogloss",
+    eta = best_params$eta,
+    max_depth = best_params$max_depth,
+    gamma = best_params$gamma,
+    colsample_bytree = best_params$colsample_bytree,
+    min_child_weight = best_params$min_child_weight,
+    subsample = best_params$subsample
+  ),
+  data = dtrain,
+  nrounds = 300,                          # Maximum training rounds
+  watchlist = watchlist,                  # Track train and validation metrics
+  verbose = 1,                            # Show progress
+  print_every_n = 100                     # Print every 100 rounds
+)
+
+# Save trained model to disk
+xgb.save(final_model, "xgb_trained_model.model")
+
+# ============================================================================
+# TRAINING VISUALIZATION
+# ============================================================================
+# Extract training history from model
+log_df <- as.data.frame(final_model$evaluation_log)
+
+# Identify best iteration (minimum validation loss)
+best_iter <- which.min(log_df$eval_mlogloss)
+best_loss <- log_df$eval_mlogloss[best_iter]
+
+# Detect plateau point (no improvement for 10 consecutive rounds)
+# This helps identify when early stopping should have occurred
+plateau_iter <- NA
+for (i in seq(best_iter, nrow(log_df) - 10)) {
+  if (all(log_df$eval_mlogloss[i:(i + 9)] > log_df$eval_mlogloss[i - 1])) {
+    plateau_iter <- i
+    break
+  }
+}
+
+# Create learning curve plot
+p2 <- ggplot(log_df, aes(x = iter)) +
+  geom_line(aes(y = train_mlogloss, color = "Train"), linewidth = 0.8) +
+  geom_line(aes(y = eval_mlogloss, color = "Validation"), linewidth = 0.8) +
+  # Mark best iteration with vertical line
+  geom_vline(
+    xintercept = best_iter,
+    linetype = "dashed",
+    color = "darkgreen",
+    linewidth = 0.8
+  ) +
+  # Highlight best point
+  geom_point(
+    data = data.frame(iter = best_iter, loss = best_loss),
+    aes(x = iter, y = loss),
+    color = "darkgreen",
+    size = 2
+  ) +
+  annotate(
+    "text",
+    x = best_iter, y = best_loss,
+    label = paste("Best:", best_iter),
+    hjust = -0.1, vjust = 1.2,
+    color = "darkgreen",
+    size = 3
+  ) +
+  labs(
+    title = "Training vs Validation Log Loss",
+    x = "Iteration",
+    y = "Log Loss"
+  ) +
+  scale_color_manual(values = c("Train" = "#FF5733", "Validation" = "#1E90FF")) +
+  theme_minimal(base_size = 10) +  # Reduced base size for grid layout
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 16),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 8),
+    axis.title = element_text(size = 9),
+    axis.text = element_text(size = 8),
+    axis.line = element_line(color = "black"),
+    panel.grid = element_blank()
+  )
+
+# ============================================================================
+# MODEL EVALUATION ON TEST SET
+# ============================================================================
+# Load trained model from disk
+loaded_model <- xgb.load("xgb_trained_model.model")
+
+# Load test dataset
+test_df <- read.csv("df_test_sub.csv", stringsAsFactors = FALSE)
+
+# Extract same features used during training (critical for consistency)
+features_test <- test_df[, train_features]
+X_test <- as.matrix(features_test)
+
+# Prepare true labels from test set
+target_test <- factor(trimws(test_df$price_tier))
+y_test <- as.numeric(target_test) - 1
+
+# Generate predictions on test set
+dtest <- xgb.DMatrix(data = X_test)
+pred_probs <- predict(loaded_model, dtest)
+
+# Convert probability vector to class predictions
+# pred_probs is returned as a flat vector, reshape to (n_samples x n_classes)
+n_classes <- length(levels(target_test))
+pred_matrix <- matrix(pred_probs, ncol = n_classes, byrow = TRUE)
+pred_class <- max.col(pred_matrix) - 1  # Get class with highest probability
+
+# Convert numeric predictions back to original factor labels
+pred_labels <- factor(
+  levels(target_test)[pred_class + 1], 
+  levels = levels(target_test)
+)
+
+# Generate confusion matrix and classification metrics
+cm <- confusionMatrix(pred_labels, target_test)
+
+# ============================================================================
+# CONFUSION MATRIX VISUALIZATION
+# ============================================================================
+# Convert confusion matrix to data frame for plotting
+cm_table <- as.data.frame(cm$table)
+colnames(cm_table) <- c("Predicted", "Actual", "Freq")
+
+# Create heatmap visualization of confusion matrix
+p3 <- ggplot(cm_table, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = Freq), size = 3.5, color = "black", fontface = "bold") +
+  scale_fill_gradient(low = "white", high = "#1E90FF") +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_y_discrete(expand = c(0, 0)) +
+  coord_fixed() +
+  labs(
+    title = "Confusion Matrix",
+    x = "Actual Price Tier",
+    y = "Predicted Price Tier",
+    fill = "Count"
+  ) +
+  theme_minimal(base_size = 10) +  # Reduced base size for grid layout
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title = element_text(size = 9),
+    axis.text = element_text(size = 8),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+# ============================================================================
+# DETAILED CLASSIFICATION REPORT
+# ============================================================================
+# Extract confusion matrix as numeric matrix
+cm_matrix <- as.matrix(cm$table)
+
+# Set class labels for rows and columns
+true_classes <- levels(target_test)
+rownames(cm_matrix) <- true_classes
+colnames(cm_matrix) <- true_classes
+
+# Calculate per-class performance metrics
+# For each class, compute Precision, Recall, and F1-Score
+metrics_list <- lapply(true_classes, function(cls) {
+  # Extract True/False Positives/Negatives for current class
+  TP <- cm_matrix[cls, cls]                      # Correctly predicted as class
+  FP <- sum(cm_matrix[cls, ]) - TP               # Incorrectly predicted as class
+  FN <- sum(cm_matrix[, cls]) - TP               # Missed predictions for class
+  TN <- sum(cm_matrix) - TP - FP - FN            # Correctly predicted as other
+  
+  # Calculate classification metrics
+  Precision <- ifelse((TP + FP) == 0, 0, TP / (TP + FP))  # Correct among predicted
+  Recall    <- ifelse((TP + FN) == 0, 0, TP / (TP + FN))  # Correct among actual
+  F1        <- ifelse((Precision + Recall) == 0, 0,       # Harmonic mean
+                     2 * Precision * Recall / (Precision + Recall))
+  Support   <- TP + FN                                     # Total samples in class
+  
+  data.frame(
+    Class = cls, 
+    Precision = Precision, 
+    Recall = Recall, 
+    F1 = F1, 
+    Support = Support
+  )
+})
+
+# Combine per-class metrics into single data frame
+metrics_df <- bind_rows(metrics_list)
+
+# Calculate overall accuracy
+total_support <- sum(metrics_df$Support)
+overall_accuracy <- sum(diag(cm_matrix)) / sum(cm_matrix)
+
+# Calculate macro average (unweighted mean across classes)
+macro_avg <- metrics_df %>%
+  summarise(
+    Precision = mean(Precision),
+    Recall = mean(Recall),
+    F1 = mean(F1),
+    Support = total_support
+  ) %>%
+  mutate(Class = "Macro Avg")
+
+# Calculate weighted average (weighted by class support)
+weighted_avg <- metrics_df %>%
+  summarise(
+    Precision = sum(Precision * Support) / total_support,
+    Recall = sum(Recall * Support) / total_support,
+    F1 = sum(F1 * Support) / total_support,
+    Support = total_support
+  ) %>%
+  mutate(Class = "Weighted Avg")
+
+wp_subhamay <- sum(metrics_df$Precision * metrics_df$Support) / total_support
+wr_subhamay <- sum(metrics_df$Recall * metrics_df$Support) / total_support
+wf_subhamay <- sum(metrics_df$F1 * metrics_df$Support) / total_support
+
+# Combine all metrics into final report
+report_df <- bind_rows(metrics_df, macro_avg, weighted_avg) %>%
+  mutate(across(where(is.numeric), ~ round(., 4)))
+
+# Format the data for display
+display_df <- report_df %>%
+  mutate(
+    Precision = sprintf("%.4f", Precision),
+    Recall = sprintf("%.4f", Recall),
+    F1 = sprintf("%.4f", F1)
+  )
+
+# Create theme for table
+table_theme <- ttheme_minimal(
+  base_size = 10,
+  core = list(
+    fg_params = list(hjust = 0.5, x = 0.5, fontface = "plain"),
+    bg_params = list(
+      fill = c(rep(c("#F8F9FA", "#FFFFFF"), length.out = nrow(display_df) - 2),
+               "#E8F4F8", "#E8F4F8")  # Light blue for summary rows
+    )
+  ),
+  colhead = list(
+    fg_params = list(fontface = "bold", fontsize = 11),
+    bg_params = list(fill = "#1E90FF", col = "white")
+  ),
+  rowhead = list(
+    fg_params = list(hjust = 0.5, x = 0.5, fontface = "plain")
+  )
+)
+
+# Convert to ggplot table
+p4 <- ggplot() +
+  annotation_custom(
+    grob = tableGrob(
+      display_df,
+      rows = NULL,
+      theme = table_theme
+    )
+  ) +
+  theme_void() +
+  labs(
+    title = "Classification Report",
+    subtitle = paste("Overall Accuracy:", round(overall_accuracy, 4))
+  ) +
+  theme_minimal(base_size = 10) +  # Reduced base size for grid layout
+  theme(
+    plot.title = element_text(
+      size = 16, 
+      face = "bold", 
+      hjust = 0.5
+    ),
+    plot.subtitle = element_text(
+      size = 11,
+      hjust = 0.5,
+      face = "bold"
+    )
+  )
+
+# ============================================================================
+# ROC–AUC ANALYSIS
+# ============================================================================
+library(pROC)
+library(reshape2)
+
+# Ensure test labels are a factor
+y_test_factor <- factor(y_test, labels = levels(target_test))
+
+# Convert predicted probabilities to a data frame
+# Make sure columns match class levels
+pred_df <- as.data.frame(pred_matrix)
+colnames(pred_df) <- levels(target_test)
+
+# Compute multiclass ROC AUC (macro average)
+roc_multi <- multiclass.roc(response = y_test_factor, predictor = pred_df)
+auc_macro <- as.numeric(roc_multi$auc)
+
+# Compute per-class ROC curves
+roc_list <- lapply(levels(y_test_factor), function(cls) {
+  roc_obj <- roc(
+    response = as.numeric(y_test_factor == cls),
+    predictor = pred_df[[cls]],
+    levels = c(0, 1),
+    direction = "<"
+  )
+  data.frame(
+    fpr = 1 - roc_obj$specificities,
+    tpr = roc_obj$sensitivities,
+    class = cls,
+    auc = as.numeric(auc(roc_obj))
+  )
+})
+
+roc_df <- bind_rows(roc_list)
+auc_mean <- mean(unique(roc_df$auc))
+
+wa_subhamay <- auc_mean
+
+# Create ROC curve plot
+p5 <- ggplot(roc_df, aes(x = fpr, y = tpr, color = class)) +
+  geom_line(linewidth = 0.8) +  
+  geom_abline(linetype = "dashed", color = "gray50") +
+  labs(
+    title = paste0("ROC Curves"),
+    subtitle = paste("Mean AUC = ", sprintf("%.3f", auc_mean),
+                   ", Macro AUC = ", sprintf("%.3f", auc_macro)),
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    color = "Class"
+  ) +
+  theme_minimal(base_size = 10) +  # Reduced base size for grid layout
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    plot.subtitle = element_text(hjust = 0.5, face = "bold", size = 10),
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 8),
+    axis.title = element_text(size = 9),
+    axis.text = element_text(size = 8),
+    axis.line = element_line(color = "black"),
+    panel.grid = element_blank()
+  )
+
+# ============================================================================
+# COMBINED VISUALIZATION GRID
+# ============================================================================
+# Combine all visualizations into 2x2 grid using patchwork
+# Layout: Feature Importance | Training Curves
+#         Confusion Matrix   | Classification Report
+
+# Small but non-zero margin around each plot
+plot_margin <- theme(plot.margin = unit(c(20, 20, 20, 20), "pt"))  # t,r,b,l in pts
+
+p1 <- p1 + plot_margin
+p2 <- p2 + plot_margin
+p3 <- p3 + plot_margin
+p4 <- p4 + plot_margin
+p5 <- p5 + plot_margin
+
+combined_plot <- (p1 | p2) / (p3 | p4 | p5) +
+  plot_layout(
+    widths = c(1, 1, 1),       # relative widths (top row only 2 plots)
+    heights = c(1, 1),         # relative heights of top/bottom rows
+  )
+
+combined_plot
+
+```
+
+

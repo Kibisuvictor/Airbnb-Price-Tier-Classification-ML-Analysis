@@ -1,0 +1,348 @@
+---
+title: "impl_gavin"
+output: html_document
+---
+## Multinomial Logistic Regression
+This analysis implements multinomial logistic regression with elastic net regularization for predicting price tiers. The model uses tidymodels framework with parallel processing for hyperparameter tuning.
+
+```{r load-libraries, include=FALSE}
+
+library(tidyverse)
+library(tidymodels)
+library(patchwork)
+library(nnet)
+library(glmnet)
+library(vip)
+library(doParallel)
+library(ggplot2)
+library(gridExtra)
+library(dplyr)
+
+```
+
+
+```{r setup-parallel, include=FALSE}
+
+## Configure Parallel Processing
+all_cores <- parallel::detectCores(logical = FALSE)
+cl <- makePSOCKcluster(all_cores - 1)
+registerDoParallel(cl)
+```
+
+
+```{r load-data-galvin, include=FALSE}
+df_train <- read_csv("df_train.csv", show_col_types = FALSE)
+df_test <- read_csv("df_test.csv", show_col_types = FALSE)
+
+df_train$price_tier <- as.factor(df_train$price_tier)
+df_test$price_tier <- as.factor(df_test$price_tier)
+
+df_train <- df_train %>%
+  mutate(
+    across(where(is.logical), as.numeric),
+    across(where(is.character), as.factor)
+  )
+
+df_test <- df_test %>%
+  mutate(
+    across(where(is.logical), as.numeric),
+    across(where(is.character), as.factor)
+  )
+
+```
+
+### Cross-Validation Setup and hyperparameter tuning
+Here the model is tuned to find optimal hyperparameter using the 
+
+```{r model-spec}
+
+set.seed(123)
+cv_folds <- vfold_cv(df_train, v = 5, strata = price_tier)
+
+mlr_recipe <- recipe(price_tier ~ ., data = df_train) %>%
+  step_rm(matches("^id$|^ID$"), skip = TRUE) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_nzv(all_predictors(), freq_cut = 95/5, unique_cut = 10) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_corr(all_numeric_predictors(), threshold = 0.9) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01, other = "other") %>%
+  step_integer(all_nominal_predictors()) %>%
+  step_zv(all_predictors())
+
+mlr_spec <- multinom_reg(
+  penalty = tune(),
+  mixture = tune()
+) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+mlr_workflow <- workflow() %>%
+  add_recipe(mlr_recipe) %>%
+  add_model(mlr_spec)
+
+
+mlr_grid <- grid_regular(
+  penalty(range = c(-4, 1)),
+  mixture(range = c(0, 1)),
+  levels = c(penalty = 10, mixture = 5)
+)
+
+# For multiclass classification, use yardstick metrics only
+# Use only yardstick metrics explicitly to avoid caret conflicts
+multiclass_metrics <- yardstick::metric_set(
+  yardstick::accuracy,
+  yardstick::roc_auc,
+  yardstick::mn_log_loss,
+  yardstick::sens,
+  yardstick::spec,
+  yardstick::precision,
+  yardstick::f_meas)
+
+
+tune_control <- control_grid(
+  save_pred = TRUE,
+  save_workflow = FALSE,
+  verbose = TRUE,
+  allow_par = TRUE,
+  parallel_over = "everything",
+  extract = NULL
+)
+
+start_time <- Sys.time()
+set.seed(456)
+
+mlr_tune_results <- tryCatch({
+  tune_grid(
+    mlr_workflow,
+    resamples = cv_folds,
+    grid = mlr_grid,
+    metrics = multiclass_metrics,
+    control = tune_control
+  )
+}, error = function(e) {
+  cat("\nTuning error:", conditionMessage(e), "\n")
+  return(NULL)
+})
+
+end_time <- Sys.time()
+tuning_duration <- difftime(end_time, start_time, units = "mins")
+
+if (is.null(mlr_tune_results)) {
+  stopCluster(cl)
+  registerDoSEQ()
+  stop("Tuning failed. Check error messages.")
+}
+```
+
+```{r tuning-results, include=FALSE}
+
+all_metrics <- collect_metrics(mlr_tune_results)
+cat("Total evaluations:", nrow(all_metrics), "\n")
+
+if (nrow(all_metrics) == 0) {
+  cat("\nNo successful models found.\n")
+  print(collect_notes(mlr_tune_results))
+  stopCluster(cl)
+  registerDoSEQ()
+  stop("All models failed.")
+}
+```
+
+```{r viz-tuning-overview3, include=FALSE}
+p1 <- autoplot(mlr_tune_results, metric = "accuracy") +
+  labs(
+    title = "Hyperparameter Tuning Results",
+    subtitle = "5-Fold Cross-Validation",
+    caption = paste("Combinations tested:", nrow(mlr_grid))
+  ) +
+  theme_minimal(base_size = 10) +  # Reduced base size for grid layout
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 10),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 8),
+    axis.title = element_text(size = 9),
+    axis.text = element_text(size = 8),
+    axis.line = element_line(color = "black"),
+    panel.grid = element_blank()
+  )
+```
+
+
+
+### Performance by Regularization Parameters
+
+```{r viz-performance-params, include=FALSE}
+p2 <- mlr_tune_results %>%
+  collect_metrics() %>%
+  filter(.metric %in% c("accuracy", "roc_auc", "f_meas")) %>%
+  ggplot(aes(x = penalty, y = mean, color = factor(mixture))) +
+  facet_wrap(~.metric, scales = "free_y") +
+  geom_line() +
+  geom_point() +
+  scale_x_log10() +
+  labs(
+    title = "Performance by Regularization Parameters",
+    x = "Penalty (log scale)",
+    y = "Mean Metric Value",
+    color = "Mixture\n(0=Ridge, 1=Lasso)"
+  ) +
+  theme_minimal()
+print(p2)
+```
+
+
+```{r viz-heatmap3, include=FALSE}
+### Accuracy Heatmap
+p3 <- mlr_tune_results %>%
+  collect_metrics() %>%
+  filter(.metric == "accuracy") %>%
+  ggplot(aes(x = factor(round(mixture, 2)), 
+             y = factor(round(log10(penalty), 2)), 
+             fill = mean)) +
+  geom_tile() +
+  scale_fill_viridis_c() +
+  labs(
+    title = "Accuracy Heatmap",
+    x = "Mixture (0=Ridge, 1=Lasso)",
+    y = "log10(Penalty)",
+    fill = "Mean\nAccuracy"
+  ) +
+  theme_minimal()
+print(p3)
+```
+
+```{r best-model3}
+best_params <- select_best(mlr_tune_results, metric = "roc_auc")
+final_mlr_workflow <- finalize_workflow(mlr_workflow, best_params)
+final_mlr_fit <- fit(final_mlr_workflow, data = df_train)
+
+final_mlr_fit <- fit(final_mlr_workflow, data = df_train)
+```
+
+
+```{r train-performance, include=FALSE}
+
+train_predictions <- predict(final_mlr_fit, df_train) %>%
+  bind_cols(predict(final_mlr_fit, df_train, type = "prob")) %>%
+  bind_cols(df_train %>% select(price_tier))
+
+train_metrics <- train_predictions %>%
+  metrics(truth = price_tier, estimate = .pred_class)
+
+
+train_conf_mat <- train_predictions %>%
+  conf_mat(truth = price_tier, estimate = .pred_class)
+
+# autoplot(train_conf_mat, type = "heatmap") +
+#   labs(title = "Training Set Confusion Matrix") +
+#   theme_minimal()
+```
+### Test Set Performance
+
+```{r test-performance}
+# Get test predictions (class + probabilities)
+test_predictions <- predict(final_mlr_fit, df_test) %>%
+  bind_cols(predict(final_mlr_fit, df_test, type = "prob")) %>%
+  bind_cols(df_test %>% select(price_tier))
+
+# Compute metrics (using yardstick explicitly to avoid caret conflicts)
+test_accuracy <- yardstick::accuracy(test_predictions, truth = price_tier, estimate = .pred_class)
+test_sensitivity <- yardstick::sensitivity(test_predictions, truth = price_tier, estimate = .pred_class, estimator = "macro")
+test_specificity <- yardstick::specificity(test_predictions, truth = price_tier, estimate = .pred_class, estimator = "macro")
+test_precision <- yardstick::precision(test_predictions, truth = price_tier, estimate = .pred_class, estimator = "macro")
+test_f1 <- yardstick::f_meas(test_predictions, truth = price_tier, estimate = .pred_class, estimator = "macro")
+
+# Get probability columns for multiclass ROC AUC
+prob_cols <- names(test_predictions)[stringr::str_detect(names(test_predictions), "^\\.pred_")]
+prob_cols <- prob_cols[prob_cols != ".pred_class"]
+
+test_roc_auc <- yardstick::roc_auc(test_predictions, truth = price_tier, all_of(prob_cols), estimator = "macro")
+
+# Combine all metrics into a single summary table
+test_metrics <- dplyr::bind_rows(
+  test_accuracy,
+  test_sensitivity,
+  test_specificity,
+  test_precision,
+  test_f1,
+  test_roc_auc
+) %>%
+  dplyr::select(.metric, .estimate) %>%
+  dplyr::arrange(desc(.estimate))
+
+# Display the summary
+#print(test_metrics)
+
+# Confusion matrix (heatmap visualization)
+test_conf_mat <- yardstick::conf_mat(test_predictions, truth = price_tier, estimate = .pred_class)
+
+p5 <- autoplot(test_conf_mat, type = "heatmap") +
+  labs(
+    title = "Test Set Confusion Matrix",
+    subtitle = paste("Accuracy:", round(test_accuracy$.estimate, 4))
+  ) +
+  theme_minimal(base_size=10) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 12),
+    axis.title = element_text(size = 9),
+    axis.text = element_text(size = 8),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 7)
+  )
+
+# Round estimates for readability
+metrics_table <- test_metrics %>%
+  arrange(desc(.estimate)) %>%
+  mutate(.estimate = round(.estimate, 3))
+
+# Create ggplot table
+table_plot <- ggplot() +
+  annotation_custom(
+    grob = tableGrob(
+      metrics_table,
+      rows = NULL,          # removes row names
+      theme = ttheme_default(
+        core = list(fg_params = list(cex = 0.8)),   # text size
+        colhead = list(fg_params = list(cex = 0.9, fontface = "bold"))
+      )
+    )
+  ) +
+  theme_void() +
+  labs(title = "Classification Report") +
+  theme(
+    plot.title = element_text(
+      size = 12, 
+      hjust = 0.5,
+      margin = margin(b = 5)
+    ),
+    plot.subtitle = element_text(
+      size = 11,
+      hjust = 0.5,
+      margin = margin(b = 10)
+    ),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+# Print the table
+( p1 | p5 | table_plot) +
+  plot_layout(ncol = 3, widths = c(1, 1, 1)) +
+  plot_annotation(
+    title = "MultiClass Logisitic Regression Model Performance Summary",
+    theme = theme(
+      plot.title = element_text(size = 12, face = "bold", hjust = 1)
+    )
+  )
+```
+Here, we have selected the optimal Regularized Multiclass Logistic Regression model by tuning the model using Nested Cross Validation:
+ - The tuning architecture used had 5 outer folds to evaluate model performance and 5 inner folds to select optimal hyperparameters.
+ - Tuned penalty (regularization strength) and alpha (regularizer type) using nested cross-validation.
+ - Optimal hyperparameters found: penalty = 1e-4, alpha = 0.5 → elastic net regularization.
+ 
+* Here, we see from the metrics table that even with the optimal hyperparameter and regularization, we see an accuracy of only 71% and a f1-score of 71% for the test data. This shows that the model does perform modestly but can be improved on even further.
+* We also see that the model has a specificity of 85%, which shows that the model performs decently when identifying false classes for a test input, but falters to a 71% sensitivity when it has to correctly identify the correct class for the test data. This shows that the model is not a confident price tier identifier for new data, but it is a good false positive alarm.
+```{r cleanup3, include=FALSE}
+stopCluster(cl)
+registerDoSEQ()
+```

@@ -1,0 +1,16 @@
+# Problem Definition  
+## Research question
+To what extent can machine learning identify the key differentiators between Budget, Standard, and Premium Airbnb listings in Melbourne Australia, and which property and host characteristics are the most influential drivers of this classification?
+
+This project is a multiclass classification problem. We are predicting a target variable, price_tier, which has three discrete categories: Budget, Standard and Premium. The goal of our model is to learn the patterns from the various features of the listings and then assign a new, unseen listing to one of these three predefined classes. This is fundamentally different from a regression problem, where we would be predicting the exact dollar price.
+
+## Why does it matter, and how does it connect to Sydney/Australia?
+This investigation has significant practical relevance for hosts, guests, and policymakers in major Australian tourism hubs like Melbourne and Sydney. By simplifying the price structure into three intuitive tiers, the insights become far more actionable:
+
+**For Hosts and Property Investors**: For a host in a competitive market like Sydney, understanding what separates a 'Standard' property from a 'Premium' one is crucial. Our model can highlight which specific features (e.g., professional photos, a dedicated workspace, superhost status) provide the best return on investment to move a listing into a higher price tier.
+
+**For Consumers (Travelers)**: The classification provides clarity for tourists. It helps them understand the value proposition of listings in cities like Sydney and Melbourne, allowing them to easily filter for properties that match their budget and expectations for quality.
+
+**For Urban Planning and Market Analysis**: For local councils and tourism bodies, analyzing the distribution and characteristics of 'Budget' versus 'Premium' listings can reveal patterns about neighbourhood development, gentrification, and the overall health of the short-term rental market. This is a key issue in Sydney, where the impact of Airbnb on housing affordability is a constant topic of debate.
+
+**Revenue optimisation**: Sydney hosts face the nation’s sharpest occupancy decline (-12 % YoY, AirDNA 2024).  A reliable Budget/Standard/Premium flag lets new hosts benchmark against comparable stock and adjust pricing or amenities quickly.
